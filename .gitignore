@@ -175,3 +175,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+
+# my notebooks
+GNN_STGNN_tutorial.ipynb
+GSL_tutorial.ipynb

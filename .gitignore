@@ -180,3 +180,9 @@ cython_debug/
 # my notebooks
 GNN_STGNN_tutorial.ipynb
 GSL_tutorial.ipynb
+
+# Dataset and config files
+spatiotemporal_pp_dataset/
+config.yaml
+hydra.yaml
+overrides.yaml

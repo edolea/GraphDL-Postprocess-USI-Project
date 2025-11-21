@@ -9,9 +9,10 @@ import mlflow
 from omegaconf import DictConfig, OmegaConf
 import hydra
 from spatiotemporal_postprocessing.utils import log_prediction_plots
+from tqdm import tqdm
 
 # NOTE uncomment to debug issues related to autograd
-# torch.autograd.set_detect_anomaly(True)
+torch.autograd.set_detect_anomaly(True)
 
 OmegaConf.register_new_resolver("add_one", lambda x: int(x) + 1)
 
@@ -67,6 +68,7 @@ def app(cfg: DictConfig):
     mlflow.set_experiment(experiment_name=cfg.logging.experiment_id)
 
     if device_type == 'cpu':
+        print("######### WARNING: GPU NOT IN USE ##########")
         torch.set_num_threads(16)
     with mlflow.start_run():
         mlflow.log_param("device_type", device_type)
@@ -82,6 +84,7 @@ def app(cfg: DictConfig):
         for epoch in range(epochs):
             model.train()
             total_loss = 0.0
+
             for batch_idx, (x_batch, y_batch) in enumerate(train_dataloader):
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
@@ -126,6 +129,11 @@ def app(cfg: DictConfig):
                     
             avg_val_loss = val_loss / len(val_dataloader)
             avg_val_loss_or = val_loss_original_range / len(val_dataloader)
+
+            # Print summary at end of epoch TODO TOREMOVE
+            print(f"Epoch {epoch+1} | Train Loss: {avg_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+
+
             mlflow.log_metric("val_loss", avg_val_loss, step=epoch)
             mlflow.log_metric("val_loss_original_range", avg_val_loss_or, step=epoch)
             

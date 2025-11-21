@@ -3,7 +3,7 @@ defaults:
 
 model: 
   type: "MLP"
-    kwargs: 
-      hidden_sizes: "(128,64,64)"
-      dropout_p: 0.2
-      output_dist: LogNormal
+  kwargs: 
+    hidden_sizes: "(128,64,64)"
+    dropout_p: 0.2
+    output_dist: LogNormal

@@ -1,10 +1,12 @@
 from einops import rearrange
-import torch.nn as nn 
+from einops.layers.torch import Rearrange
+import torch.nn as nn
 import torch
 from typing import Literal
 from tsl.nn.layers import GatedGraphNetwork, NodeEmbedding, BatchNorm
 from tsl.nn.models import GraphWaveNetModel
 from spatiotemporal_postprocessing.nn.probabilistic_layers import dist_to_layer
+from spatiotemporal_postprocessing.nn.prototypes import TCNLayer
 
 
 class LayeredGraphRNN(nn.Module):
@@ -144,22 +146,131 @@ class MLP(nn.Module):
     
     
 class WaveNet(nn.Module):
-    
+
     def __init__(self, input_size, time_steps, hidden_size, n_stations, output_dist, ff_size=256, n_layers=6, temporal_kernel_size=3, spatial_kernel_size=2, **kwargs):
         super().__init__()
-    
-        self.wavenet = GraphWaveNetModel(input_size=input_size, 
+
+        self.wavenet = GraphWaveNetModel(input_size=input_size,
                           output_size=hidden_size,
-                          horizon=time_steps, 
-                          hidden_size=hidden_size, 
+                          horizon=time_steps,
+                          hidden_size=hidden_size,
                           ff_size=ff_size,
                           n_layers=n_layers,
-                          temporal_kernel_size=temporal_kernel_size, spatial_kernel_size=spatial_kernel_size, 
+                          temporal_kernel_size=temporal_kernel_size, spatial_kernel_size=spatial_kernel_size,
                           dilation=2, dilation_mod=3, n_nodes=n_stations)
         self.output_distr = dist_to_layer[output_dist](input_size=hidden_size)
-        
+
     def forward(self, x, edge_index):
         output = self.wavenet(x, edge_index)
-        
+
+        return self.output_distr(output)
+
+
+class Model0TCN(nn.Module):
+    """
+    TCN-only baseline model (Model0) for statistical postprocessing.
+
+    Architecture:
+    - No graph operations: Processes each station's time series independently
+    - Temporal modeling only: Uses stacked TCN layers with causal convolutions
+    - Station-independent: No message passing or spatial aggregation
+    - Probabilistic output: Outputs LogNormal distribution parameters
+
+    The model processes input shape [batch, time, stations, features] by:
+    1. Reshaping to [batch*stations, features, time] for Conv1d processing
+    2. Applying input encoder to project features to hidden dimension
+    3. Processing through stacked TCN layers with increasing dilation rates
+    4. Reshaping back to [batch, time, stations, hidden]
+    5. Applying distribution layer to get probabilistic outputs
+
+    Args:
+        input_size: Number of input features per station
+        hidden_channels: Hidden dimension size
+        n_stations: Number of weather stations
+        output_dist: Distribution type (e.g., 'LogNormal')
+        num_layers: Number of TCN layers (default: 4)
+        kernel_size: Convolution kernel size (default: 3)
+        dropout_p: Dropout probability (default: 0.2)
+    """
+
+    def __init__(self, input_size, hidden_channels, n_stations, output_dist,
+                 num_layers=4, kernel_size=3, dropout_p=0.2, **kwargs):
+        super().__init__()
+
+        self.n_stations = n_stations
+        self.hidden_channels = hidden_channels
+
+        # Input encoder: project features to hidden dimension
+        self.encoder = nn.Linear(input_size, hidden_channels)
+
+        # Rearrange layers for shape transformations
+        # From [batch, time, stations, features] to [batch*stations, features, time]
+        self.rearrange_for_tcn = Rearrange('b t n c -> (b n) c t')
+        # From [batch*stations, channels, time] back to [batch, time, stations, channels]
+        self.rearrange_from_tcn = Rearrange('(b n) c t -> b t n c', n=n_stations)
+
+        # Build TCN layers with exponentially increasing dilation rates
+        tcn_layers = []
+        for layer_idx in range(num_layers):
+            dilation = 2 ** layer_idx  # 1, 2, 4, 8, ...
+            in_channels = hidden_channels  # All layers use same hidden dimension
+
+            tcn_layers.append(
+                TCNLayer(
+                    in_channels=in_channels,
+                    out_channels=hidden_channels,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    dropout_p=dropout_p,
+                    causal_conv=True  # Ensure no future information leakage
+                )
+            )
+
+        self.tcn_layers = nn.ModuleList(tcn_layers)
+
+        # Probabilistic output layer
+        self.output_distr = dist_to_layer[output_dist](input_size=hidden_channels)
+
+    def forward(self, x, edge_index=None):
+        """
+        Forward pass through the TCN baseline.
+
+        Args:
+            x: Input tensor of shape [batch, time, stations, features]
+            edge_index: Graph edge indices (accepted but ignored for compatibility)
+
+        Returns:
+            Distribution object with parameters of shape [batch, time, stations, output_dim]
+        """
+        # Store input shape for reshaping
+        batch_size, time_steps, num_stations, num_features = x.size()
+
+        # Encode input features to hidden dimension
+        # Shape: [batch, time, stations, features] -> [batch, time, stations, hidden]
+        x = self.encoder(x)
+
+        # Reshape for Conv1d: [batch, time, stations, hidden] -> [batch*stations, hidden, time]
+        x = self.rearrange_for_tcn(x)
+
+        # Apply TCN layers with skip connections
+        skips = []
+        for tcn_layer in self.tcn_layers:
+            # TCNLayer returns (residual_output, skip_output)
+            x, skip = tcn_layer(x)
+            skips.append(skip)
+
+        # Aggregate skip connections and final output
+        # Stack and sum all skip connections
+        skips_stack = torch.stack(skips, dim=-1)  # [batch*stations, hidden, time, num_layers]
+        skips_sum = skips_stack.sum(dim=-1)  # [batch*stations, hidden, time]
+
+        # Combine skip connections with final layer output
+        output = skips_sum + x  # [batch*stations, hidden, time]
+
+        # Reshape back to original structure
+        # [batch*stations, hidden, time] -> [batch, time, stations, hidden]
+        output = self.rearrange_from_tcn(output)
+
+        # Apply distribution layer to get probabilistic outputs
         return self.output_distr(output)
    

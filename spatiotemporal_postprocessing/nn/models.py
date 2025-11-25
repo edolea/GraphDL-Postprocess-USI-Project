@@ -193,12 +193,8 @@ class Model0TCN(nn.Module):
         dropout_p: Dropout probability (default: 0.2)
     """
 
-    def __init__(self, input_size, hidden_channels, n_stations, output_dist,
-                 num_layers=4, kernel_size=3, dropout_p=0.2, **kwargs):
+    def __init__(self, input_size, hidden_channels, n_stations, output_dist: str, num_layers, kernel_size, dropout_p, **kwargs):
         super().__init__()
-
-        self.n_stations = n_stations
-        self.hidden_channels = hidden_channels
 
         # Input encoder: project features to hidden dimension
         self.encoder = nn.Linear(input_size, hidden_channels)

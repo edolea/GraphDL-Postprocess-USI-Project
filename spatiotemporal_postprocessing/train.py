@@ -10,11 +10,13 @@ from omegaconf import DictConfig, OmegaConf
 import hydra
 from spatiotemporal_postprocessing.utils import log_prediction_plots
 from tqdm import tqdm
+import os
 
 # NOTE uncomment to debug issues related to autograd
 torch.autograd.set_detect_anomaly(True)
 
 OmegaConf.register_new_resolver("add_one", lambda x: int(x) + 1)
+OmegaConf.register_new_resolver("oc.env_or", lambda var_name, default_value: os.getenv(var_name, default_value))
 
 @hydra.main(version_base="1.1", config_path="./configs", config_name="default_training_conf")
 def app(cfg: DictConfig):
@@ -63,7 +65,12 @@ def app(cfg: DictConfig):
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
     edge_index = edge_index.to(device)
-    
+
+    # Set DagHub credentials BEFORE setting tracking URI
+    if "dagshub.com" in cfg.logging.mlflow_tracking_uri:
+        dagshub_token = os.getenv("MLFLOW_TRACKING_TOKEN") or os.getenv("DAGSHUB_TOKEN")
+        dagshub_username = os.getenv("MLFLOW_TRACKING_USERNAME") or os.getenv("DAGSHUB_USER_NAME")
+
     mlflow.set_tracking_uri(cfg.logging.mlflow_tracking_uri)
     mlflow.set_experiment(experiment_name=cfg.logging.experiment_id)
 

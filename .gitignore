@@ -1,5 +1,9 @@
+help.sh
+
 # Mlflow
 mlruns
+spatiotemporal_postprocessing/mlruns
+spatiotemporal_postprocessing/predictions*.png
 
 # VScode
 .vscode
@@ -183,6 +187,7 @@ GSL_tutorial.ipynb
 
 # Dataset and config files
 spatiotemporal_pp_dataset/
+data/
 config.yaml
 hydra.yaml
 overrides.yaml

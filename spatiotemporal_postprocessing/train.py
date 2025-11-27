@@ -13,7 +13,7 @@ from tqdm import tqdm
 import os
 
 # NOTE uncomment to debug issues related to autograd
-torch.autograd.set_detect_anomaly(True)
+# torch.autograd.set_detect_anomaly(True)
 
 OmegaConf.register_new_resolver("add_one", lambda x: int(x) + 1)
 OmegaConf.register_new_resolver("oc.env_or", lambda var_name, default_value: os.getenv(var_name, default_value))
@@ -73,11 +73,16 @@ def app(cfg: DictConfig):
 
     mlflow.set_tracking_uri(cfg.logging.mlflow_tracking_uri)
     mlflow.set_experiment(experiment_name=cfg.logging.experiment_id)
+    
+    run_name = OmegaConf.select(cfg, "logging.run_name")
+    if run_name is None or run_name == "null":
+        run_name = None  # MLflow will auto-generate a name
 
     if device_type == 'cpu':
         print("######### WARNING: GPU NOT IN USE ##########")
         torch.set_num_threads(16)
-    with mlflow.start_run():
+    
+    with mlflow.start_run(run_name=run_name):
         mlflow.log_param("device_type", device_type)
         mlflow.log_param("optimizer", type(optimizer).__name__) 
         mlflow.log_param("criterion", type(criterion).__name__) 
@@ -95,6 +100,12 @@ def app(cfg: DictConfig):
             for batch_idx, (x_batch, y_batch) in enumerate(train_dataloader):
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
+
+                if batch_idx == 0:
+                    print("x_batch", x_batch.shape)
+                    print("max alloc MB", torch.cuda.max_memory_allocated() / 1e6)
+                    torch.cuda.reset_peak_memory_stats()
+
                 
                 optimizer.zero_grad()  
                 predictions = model(x_batch, edge_index=edge_index)  
@@ -108,7 +119,8 @@ def app(cfg: DictConfig):
                 optimizer.step()  
                 total_loss += loss.item()
 
-                mlflow.log_metric("loss", loss.item(), step=total_iter)
+                if total_iter % 25 == 0:
+                    mlflow.log_metric("loss", loss.item(), step=total_iter)
                 
                 total_iter += 1
 
@@ -163,3 +175,4 @@ def app(cfg: DictConfig):
             
 if __name__ == '__main__':
     app()
+    print("\n\nTraining completed.")

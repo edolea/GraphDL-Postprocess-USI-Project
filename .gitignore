@@ -4,6 +4,8 @@ help.sh
 mlruns
 spatiotemporal_postprocessing/mlruns
 spatiotemporal_postprocessing/predictions*.png
+spatiotemporal_postprocessing/hydra_output/
+spatiotemporal_postprocessing/artifacts/
 
 # VScode
 .vscode

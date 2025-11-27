@@ -1,7 +1,9 @@
 import matplotlib.pyplot as plt 
 import mlflow
 import numpy as np
-import torch 
+import torch
+from hydra.core.hydra_config import HydraConfig
+import os 
 
 def log_prediction_plots(x, y, pred_dist, example_indices, stations, epoch, input_denormalizer):
     x = input_denormalizer(x) # bring inputs to their original range
@@ -46,8 +48,14 @@ def log_prediction_plots(x, y, pred_dist, example_indices, stations, epoch, inpu
     plt.suptitle(f'Predictions at Epoch {epoch}')
     plt.tight_layout()
 
-
-    plot_filename = f"predictions_epoch_{epoch}.png"
+    # Get Hydra output directory
+    try:
+        hydra_cfg = HydraConfig.get()
+        output_dir = hydra_cfg.runtime.output_dir
+    except:
+        output_dir = "./"
+    
+    plot_filename = os.path.join(output_dir, f"predictions_epoch_{epoch}.png")
     plt.savefig(plot_filename)
     plt.close(fig) 
 

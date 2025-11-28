@@ -307,6 +307,44 @@ class GraphAttentionLayer(nn.Module):
             out = out.mean(dim=1)
             
         return out
+    
+# If too slow, try this attention version, should be faster (adn hopeful wont impact performace)
+# class GraphAttention(nn.Module):
+#     """Simplified attention: Single head instead of multi-head - ~3x faster ????"""
+#     def __init__(self, in_features, out_features, dropout_p=0.1):
+#         super().__init__()
+#         self.W = nn.Linear(in_features, out_features, bias=False)
+#         self.a = nn.Parameter(torch.Tensor(out_features, 1))
+#         self.leaky_relu = nn.LeakyReLU(0.2)
+#         self.dropout = nn.Dropout(dropout_p)
+#         nn.init.xavier_uniform_(self.W.weight)
+#         nn.init.xavier_uniform_(self.a)
+        
+#     def forward(self, x, edge_index):
+#         batch_size, num_nodes, _ = x.size()
+#         h = self.W(x)  # [batch, nodes, features]
+        
+#         # Simplified attention: just use source node features
+#         src_idx, dst_idx = edge_index[0], edge_index[1]
+#         alpha = self.leaky_relu((h[:, src_idx] * self.a.t()).sum(dim=-1))
+        
+#         # Softmax per target node
+#         alpha_max = torch.zeros(batch_size, num_nodes, device=x.device)
+#         alpha_max.scatter_reduce_(1, dst_idx.unsqueeze(0).expand(batch_size, -1), 
+#                                    alpha, reduce='amax', include_self=False)
+#         alpha = torch.exp(alpha - alpha_max[:, dst_idx])
+        
+#         alpha_sum = torch.zeros(batch_size, num_nodes, device=x.device)
+#         alpha_sum.scatter_add_(1, dst_idx.unsqueeze(0).expand(batch_size, -1), alpha)
+#         alpha = alpha / (alpha_sum[:, dst_idx] + 1e-10)
+#         alpha = self.dropout(alpha)
+        
+#         # Aggregate
+#         h_agg = torch.zeros(batch_size, num_nodes, h.size(-1), device=x.device)
+#         h_agg.scatter_add_(1, dst_idx.unsqueeze(0).unsqueeze(-1).expand(
+#             batch_size, -1, h.size(-1)), h[:, src_idx] * alpha.unsqueeze(-1))
+        
+#         return h_agg
 
 
 class EnhancedLayeredGraphRNN(nn.Module):
@@ -336,12 +374,12 @@ class EnhancedLayeredGraphRNN(nn.Module):
             GraphAttentionLayer(
                 in_features=hidden_size * 2,
                 out_features=hidden_size,
-                num_heads=num_heads,
+                num_heads=num_heads, # TODO to remove if testing on single head attention 
                 dropout_p=dropout_p,
                 concat=True
             ) for _ in range(n_layers)
         ])
-        
+
         # Projection layers for multi-head outputs
         self.head_projection = nn.ModuleList([
             nn.Linear(hidden_size * num_heads, hidden_size) 
@@ -399,6 +437,8 @@ class EnhancedLayeredGraphRNN(nn.Module):
             
             # Multi-scale temporal skip connections
             state = state_out + state
+
+            # TODO: Tune coefficients (anche a mano, se non si vedono improvements, va bene anche rimuovere la history)
             state_history.append(state)
             
             if len(state_history) >= 2:

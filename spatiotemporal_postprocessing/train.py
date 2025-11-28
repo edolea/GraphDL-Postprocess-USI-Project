@@ -50,6 +50,7 @@ def app(cfg: DictConfig):
     
     assert dm.train_dataset.stations == dm.val_dataset.stations == dm.test_dataset.stations # sanity check 
     
+    # MODEL LOAD
     model_kwargs = {'input_size': dm.train_dataset.f, 
                     'n_stations': dm.train_dataset.stations,
                     **cfg.model.kwargs} 
@@ -102,8 +103,8 @@ def app(cfg: DictConfig):
                 y_batch = y_batch.to(device)
 
                 if batch_idx == 0:
-                    print("x_batch", x_batch.shape)
-                    print("max alloc MB", torch.cuda.max_memory_allocated() / 1e6)
+                    # print("x_batch", x_batch.shape)
+                    # print("max alloc MB", torch.cuda.max_memory_allocated() / 1e6)
                     torch.cuda.reset_peak_memory_stats()
 
                 

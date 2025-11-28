@@ -309,7 +309,7 @@ class GraphAttentionLayer(nn.Module):
         return out
     
 # If too slow, try this attention version, should be faster (adn hopeful wont impact performace)
-# class GraphAttention(nn.Module):
+# class GraphAttentionLayer(nn.Module):
 #     """Simplified attention: Single head instead of multi-head - ~3x faster ????"""
 #     def __init__(self, in_features, out_features, dropout_p=0.1):
 #         super().__init__()

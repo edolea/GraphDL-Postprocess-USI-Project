@@ -134,7 +134,8 @@ class PostprocessDatamodule():
         dm_str += str(self.val_dataset)
         dm_str += "Test:\n"
         dm_str += str(self.test_dataset)
-        
+        if self.adj_matrix is not None:
+            dm_str += f"Number of stations = {self.adj_matrix.shape[0]}\n"
         dm_str += f"Number of edges = {self.num_edges}"
         return dm_str
 

@@ -126,7 +126,6 @@ def evaluate_crps_weighted_over_batches(model,
 
     return crps_mean, crps_at_leads
 
-
 @torch.no_grad()
 def evaluate_crps(
     model,
@@ -241,13 +240,16 @@ def evaluate_crps(
 
     return crps_mean, crps_at_leads
 
+
 def _init_metric_store():
     return {"crps_sum": 0.0, "mae_sum": 0.0, "count": 0}
+
 
 def _update_metric_store(store, batch_crps, batch_mae, valid_count):
     store["crps_sum"] += batch_crps * valid_count
     store["mae_sum"]  += batch_mae  * valid_count
     store["count"]    += valid_count
+
 
 def _finalize_metric_store(store):
     if store["count"] == 0:
@@ -266,6 +268,7 @@ def lognormal_params_from_mean_std(mean, std, eps=1e-6):
     mu = torch.log(mean) - 0.5 * log_term
     sigma = torch.sqrt(torch.clamp(log_term, min=eps))
     return mu, sigma
+
 
 @torch.no_grad()
 def evaluaate_crps_with_nwp_baseline(model,
@@ -429,7 +432,7 @@ def evaluaate_crps_with_nwp_baseline(model,
         model_mae_lt = model_mae_per_lead[lt]
         nwp_crps_lt = nwp_crps_per_lead[lt]
         nwp_mae_lt = nwp_mae_per_lead[lt]
-        result_str += "\n t= {:>3}h | CRPS: {} (NWP: {}) | MAE: {} (NWP: {})".format(
+        result_str += "\nt= {:>3}h | CRPS: {} (NWP: {}) | MAE: {} (NWP: {})".format(
             lt,
             f"{model_crps_lt:.4f}" if model_crps_lt is not None else "N/A",
             f"{nwp_crps_lt:.4f}" if nwp_crps_lt is not None else "N/A",

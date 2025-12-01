@@ -14,6 +14,115 @@ import os
 import random
 import numpy as np
 
+import matplotlib.pyplot as plt
+import numpy as np
+
+CUDA_MEM = False
+
+#TODO: improve talagrand by keeping all in gpu, not moving to cpu and then gpu
+
+@torch.no_grad()
+def collect_model_outputs(model, 
+                          data_loader, 
+                          device, 
+                          edge_index=None):
+    """
+    Collect mu, sigma, and targets over an entire dataloader.
+
+    Returns
+    -------
+    mu_all, sigma_all, targets_all : tensors of shape [N, L, S]
+        N = total number of forecast reference times over all batches.
+    """
+    model.eval()
+    all_mu = []
+    all_sigma = []
+    all_targets = []
+
+    for x_batch, y_batch in tqdm(data_loader, desc="Collecting model mu and sigma"):
+        x_batch = x_batch.to(device)
+        y_batch = y_batch.to(device)
+
+        # Assuming model returns a distribution with .loc and .scale
+        if edge_index is not None:
+            pred_dist = model(x_batch, edge_index=edge_index)
+        else:
+            pred_dist = model(x_batch)
+
+        mu = pred_dist.loc      # [B, L, S]
+        sigma = pred_dist.scale # [B, L, S]
+
+        all_mu.append(mu.cpu())
+        all_sigma.append(sigma.cpu())
+        all_targets.append(y_batch.cpu())
+
+    mu_all = torch.cat(all_mu, dim=0)          # [N, L, S]
+    sigma_all = torch.cat(all_sigma, dim=0)    # [N, L, S]
+    targets_all = torch.cat(all_targets, dim=0) # [N, L, S]
+
+    return mu_all, sigma_all, targets_all
+
+
+@torch.no_grad()
+def rank_histogram_for_lead(mu_all,
+                            sigma_all,
+                            targets_all,
+                            device,
+                            lead_idx=(1, 24, 48, 96),
+                            n_samples=20,
+):
+    """
+    Compute Talagrand / rank histogram for a single lead time.
+
+    Parameters
+    ----------
+    mu_all, sigma_all, targets_all : torch.Tensor
+        Shape [N, L, S].
+    lead_idx : int
+        0-based index of the lead time (e.g. lead_idx = 0, 23, 47, 95).
+    n_samples : int
+        Number of samples drawn from the predictive distribution.
+        Histogram will have n_samples + 1 bins.
+    device : str or torch.device
+        Device on which to perform sampling.
+
+    Returns
+    -------
+    hist : torch.Tensor
+        Shape [n_samples + 1], counts of ranks 0..n_samples.
+    """
+
+    # Slice lead: [N, S]
+    mu_t = mu_all[:, lead_idx].to(device)        # [N, S]
+    sigma_t = sigma_all[:, lead_idx].to(device)  # [N, S]
+    y_t = targets_all[:, lead_idx].to(device)    # [N, S]
+
+    # Build LogNormal distribution at this lead
+    dist = torch.distributions.LogNormal(mu_t, sigma_t)
+
+    # Sample shape: [n_samples, N, S]
+    samples = dist.rsample((n_samples,))  # rsample if you want gradients, sample otherwise
+
+    # Flatten across (N, S): treat each (forecast_time, station) as an independent case
+    y_flat = y_t.reshape(-1)                    # [M]
+    samples_flat = samples.reshape(n_samples, -1)  # [n_samples, M]
+
+    # Keep only finite targets
+    valid_flat = torch.isfinite(y_flat)
+    y_flat = y_flat[valid_flat]                  # [M_valid]
+    samples_flat = samples_flat[:, valid_flat]   # [n_samples, M_valid]
+
+    # Compute ranks:
+    # For each case j, rank_j = number of samples < observation
+    # ranks in {0, 1, ..., n_samples}
+    ranks = (samples_flat < y_flat.unsqueeze(0)).sum(dim=0)  # [M_valid]
+
+    # Histogram of ranks
+    hist = torch.bincount(ranks, minlength=n_samples + 1)
+
+    return hist.cpu()
+
+
 
 @torch.no_grad()
 def evaluate_crps_weighted_over_batches(model,
@@ -364,7 +473,10 @@ def evaluaate_crps_with_nwp_baseline(model,
         # ---- PER-LEAD METRICS ----
         for lead_hour in available_leads:
             # Slice this lead: keep shape [B, 1, S] (+1 for last dim)
+            # TODO: SUPER MEGA DOUBLE CHECK lead index, DOVREBBE ESSERE 0,23,47,95?
             y_lead = y_den[:, lead_hour:lead_hour+1, ...] # l_h:l_h+1 to keep dim: [B, 1, S]
+            #if lead_hour == 96:
+             #   print("y_lead: ", y_lead[0,0,:])
             lead_mask = ~torch.isnan(y_lead)
             lead_count = lead_mask.sum().item()
             if lead_count == 0:
@@ -452,6 +564,7 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
 
 # NOTE uncomment to debug issues related to autograd
 # torch.autograd.set_detect_anomaly(True)
@@ -554,9 +667,9 @@ def app(cfg: DictConfig):
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
 
-                if batch_idx == 0:
-                    # print("x_batch", x_batch.shape)
-                    # print("max alloc MB", torch.cuda.max_memory_allocated() / 1e6)
+                if CUDA_MEM and batch_idx == 0:
+                    print("x_batch", x_batch.shape)
+                    print("max alloc MB", torch.cuda.max_memory_allocated() / 1e6)
                     torch.cuda.reset_peak_memory_stats()
                 
                 optimizer.zero_grad()  
@@ -639,6 +752,60 @@ def app(cfg: DictConfig):
         )
         print(result_str)
         mlflow.log_text(result_str, "test_results.txt")
+        
+        ## TALAGRAND DIAGRAM
+        # Collect model outputs on TEST set
+        mu_all, sigma_all, targets_all = collect_model_outputs(
+            model=model,
+            data_loader=test_dataloader,
+            device=device,
+            edge_index=edge_index,
+        )
+
+        lead_hours_to_plot = {1, 24, 48, 96}
+        histograms = {}
+        ml_text_talagrand = ""
+
+        for lead_hour in tqdm(lead_hours_to_plot, desc="Computing Talagrand Histograms"):
+            hist = rank_histogram_for_lead(
+                mu_all=mu_all,
+                sigma_all=sigma_all,
+                targets_all=targets_all,
+                device=device,
+                n_samples=20,
+            )
+
+            histograms[lead_hour] = hist
+
+            # print(f"Lead t={lead_hour}: total cases = {hist.sum().item()}, "f"hist = {hist.tolist()}")
+            ml_text_talagrand += f"Lead t={lead_hour}:\n\ttotal cases = {hist.sum().item()},\n\thist = {hist.tolist()}\n"
+
+            for lead_hour, hist in histograms.items():
+                hist_np = hist.numpy().astype(float)
+                hist_np /= hist_np.sum()
+
+                ranks = np.arange(len(hist_np))  # 0..20
+
+                plt.figure()
+                plt.bar(ranks, hist_np, width=0.8, edgecolor='black')
+                plt.xlabel("Rank")
+                plt.ylabel("Relative frequency")
+                plt.title(f"Rank histogram - lead t={lead_hour}", fontsize=14)
+                plt.xticks(ranks)
+                plt.grid(axis='y', alpha=0.3)
+                
+                # expected uniform line
+                expected_freq = 1.0 / len(hist_np)
+                plt.axhline(y=expected_freq, color='red', linestyle='--', linewidth=2, label=f'Expected (uniform): {expected_freq:.4f}')
+                plt.legend()
+                
+                plot_filename = os.path.join(f"talagrand_diagram_lead{lead_hour}.png")
+                plt.savefig(plot_filename)
+                mlflow.log_figure(plt.gcf(), f"talagrand_diagram_lead{lead_hour}.png")
+                plt.close()
+        
+        mlflow.log_text(ml_text_talagrand, "talagrand_histograms.txt")
+        print(ml_text_talagrand)
 
 
 if __name__ == '__main__':

@@ -47,15 +47,9 @@ def log_prediction_plots(x, y, pred_dist, example_indices, stations, epoch, inpu
 
     plt.suptitle(f'Predictions at Epoch {epoch}')
     plt.tight_layout()
-
-    # Get Hydra output directory
-    try:
-        hydra_cfg = HydraConfig.get()
-        output_dir = hydra_cfg.runtime.output_dir
-    except:
-        output_dir = "./"
     
-    plot_filename = os.path.join(output_dir, f"predictions_epoch_{epoch}.png")
+    os.makedirs("results", exist_ok=True)
+    plot_filename = os.path.join("results", f"predictions_epoch_{epoch}.png")
     plt.savefig(plot_filename)
     plt.close(fig) 
 

@@ -1,4 +1,6 @@
 help.sh
+run_experiments.sh
+results/
 
 # Mlflow
 mlruns
@@ -7,6 +9,8 @@ spatiotemporal_postprocessing/predictions*.png
 spatiotemporal_postprocessing/hydra_output/
 spatiotemporal_postprocessing/artifacts/
 spatiotemporal_postprocessing/talagrand_diagram*.png
+
+.DS_Store
 
 # VScode
 .vscode

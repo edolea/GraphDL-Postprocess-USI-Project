@@ -17,6 +17,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import numpy as np
 
+import shutil
+
 CUDA_MEM = False
 
 #TODO: improve talagrand by keeping all in gpu, not moving to cpu and then gpu
@@ -574,6 +576,9 @@ OmegaConf.register_new_resolver("oc.env_or", lambda var_name, default_value: os.
 
 @hydra.main(version_base="1.1", config_path="./configs", config_name="default_training_conf")
 def app(cfg: DictConfig):
+    if os.path.exists("results"):
+        shutil.rmtree("results")
+    os.makedirs("results")
     # Set seed for reproducibility
     set_seed(42)
     
@@ -627,6 +632,7 @@ def app(cfg: DictConfig):
     optimizer = getattr(torch.optim, cfg.training.optim.algo)(model.parameters(), **cfg.training.optim.kwargs)
     lr_scheduler = getattr(torch.optim.lr_scheduler, cfg.training.scheduler.algo)(optimizer, **cfg.training.scheduler.kwargs)
     gradient_clip_value = cfg.training.gradient_clip_value
+    gradient_accumulation_steps = cfg.training.get('gradient_accumulation_steps', 1)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
@@ -659,7 +665,9 @@ def app(cfg: DictConfig):
         mlflow.log_params(cfg_dict)
         
         total_iter = 0
-        for epoch in tqdm(range(epochs), desc="Epochs"):
+        loss_str = ""
+        epoch_pbar = tqdm(range(epochs), desc="Epochs")
+        for epoch in epoch_pbar:
             model.train()
             total_loss = 0.0
 
@@ -667,24 +675,32 @@ def app(cfg: DictConfig):
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
 
-                if CUDA_MEM and batch_idx == 0:
-                    print("x_batch", x_batch.shape)
-                    print("max alloc MB", torch.cuda.max_memory_allocated() / 1e6)
-                    torch.cuda.reset_peak_memory_stats()
+                if CUDA_MEM and batch_idx == 1:
+                    torch.cuda.reset_peak_memory_stats()  # Reset BEFORE processing this batch
                 
-                optimizer.zero_grad()  
                 predictions = model(x_batch, edge_index=edge_index)  
 
-                loss = criterion(predictions, y_batch) 
+                loss = criterion(predictions, y_batch)
+                # Scale loss by accumulation steps to maintain consistent gradient magnitude
+                loss = loss / gradient_accumulation_steps
                 loss.backward()  
                 
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_value)
+                # Only update weights every gradient_accumulation_steps
+                if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_dataloader):
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_value)
+                    optimizer.step()
+                    optimizer.zero_grad()
                 
-                optimizer.step()  
-                total_loss += loss.item()
+                if CUDA_MEM and batch_idx == 1:
+                    print(f"Epoch {epoch}, Batch {batch_idx}")
+                    print("x_batch shape:", x_batch.shape)
+                    print("Peak memory allocated (MB):", torch.cuda.max_memory_allocated() / 1e6)
+                    # print("Current memory allocated (MB):", torch.cuda.memory_allocated() / 1e6)
+                
+                total_loss += loss.item() * gradient_accumulation_steps  # Rescale for logging
 
                 if total_iter % 25 == 0:
-                    mlflow.log_metric("loss", loss.item(), step=total_iter)
+                    mlflow.log_metric("loss", loss.item() * gradient_accumulation_steps, step=total_iter)
                 
                 total_iter += 1
 
@@ -702,7 +718,7 @@ def app(cfg: DictConfig):
             model.eval()
             with torch.no_grad():
                 tgt_denormalizer = dm.val_dataset.target_denormalizer #NOTE: this is no-op --> should double check
-                for batch_idx, (x_batch, y_batch) in enumerate(val_dataloader):
+                for batch_idx, (x_batch, y_batch) in tqdm(enumerate(val_dataloader), desc="Validation Batches", total=len(val_dataloader), leave=False):
                     x_batch = x_batch.to(device)
                     y_batch = y_batch.to(device)
                     predictions = model(x_batch, edge_index=edge_index)  
@@ -714,8 +730,12 @@ def app(cfg: DictConfig):
             avg_val_loss = val_loss / len(val_dataloader)
             avg_val_loss_or = val_loss_original_range / len(val_dataloader)
 
-            # Print summary at end of epoch TODO TOREMOVE
-            print(f"Epoch {epoch+1} | Train Loss: {avg_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+            # Update progress bar with metrics
+            epoch_pbar.set_postfix({
+                'train_loss': f'{avg_loss:.4f}',
+                'val_loss': f'{avg_val_loss:.4f}'
+            })
+            loss_str += f"Epoch {epoch}: Train Loss = {avg_loss:.4f}, Val Loss = {avg_val_loss:.4f}\n"
 
             mlflow.log_metric("val_loss", avg_val_loss, step=epoch)
             mlflow.log_metric("val_loss_original_range", avg_val_loss_or, step=epoch)
@@ -736,6 +756,10 @@ def app(cfg: DictConfig):
                                         epoch=epoch,
                                         input_denormalizer=dm.val_dataset.input_denormalizer)
 
+        print("\n",   loss_str, "\n")
+        mlflow.log_text(loss_str, "training_loss_history.txt")
+        with open(os.path.join("results", "training_loss_history.txt"), "w") as f:
+            f.write(loss_str)
 
         ## TEST LOOP
         result_str = evaluaate_crps_with_nwp_baseline(
@@ -752,6 +776,8 @@ def app(cfg: DictConfig):
         )
         print(result_str)
         mlflow.log_text(result_str, "test_results.txt")
+        with open(os.path.join("results", "test_results.txt"), "w") as f:
+            f.write(result_str)
         
         ## TALAGRAND DIAGRAM
         # Collect model outputs on TEST set
@@ -799,13 +825,14 @@ def app(cfg: DictConfig):
                 plt.axhline(y=expected_freq, color='red', linestyle='--', linewidth=2, label=f'Expected (uniform): {expected_freq:.4f}')
                 plt.legend()
                 
-                plot_filename = os.path.join(f"talagrand_diagram_lead{lead_hour}.png")
+                os.makedirs("results", exist_ok=True)
+                plot_filename = os.path.join("results", f"talagrand_diagram_lead{lead_hour}.png")
                 plt.savefig(plot_filename)
                 mlflow.log_figure(plt.gcf(), f"talagrand_diagram_lead{lead_hour}.png")
                 plt.close()
         
         mlflow.log_text(ml_text_talagrand, "talagrand_histograms.txt")
-        print(ml_text_talagrand)
+        #print(ml_text_talagrand)
 
 
 if __name__ == '__main__':

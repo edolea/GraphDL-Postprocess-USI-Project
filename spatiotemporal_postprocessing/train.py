@@ -675,8 +675,8 @@ def app(cfg: DictConfig):
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
 
-                if CUDA_MEM and batch_idx == 1:
-                    torch.cuda.reset_peak_memory_stats()  # Reset BEFORE processing this batch
+                # if CUDA_MEM and batch_idx == 1:
+                #     torch.cuda.reset_peak_memory_stats()  # Reset BEFORE processing this batch
                 
                 predictions = model(x_batch, edge_index=edge_index)  
 

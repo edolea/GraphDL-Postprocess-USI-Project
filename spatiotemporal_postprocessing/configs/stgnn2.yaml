@@ -1,0 +1,24 @@
+defaults: 
+  - default_training_conf.yaml
+
+model: 
+  type: "AttentionTCN_GNN"
+  kwargs: 
+    num_layers: 4
+    hidden_channels: 64
+    kernel_size: 3
+    dropout_p: 0.2
+    
+    # We keep causal_conv: False (Bi-directional) because in post-processing 
+    # we have the entire NWP forecast sequence available at t0. 
+    # This allows the model to use t+1 info to correct t.
+    causal_conv: False 
+    output_dist: LogNormal
+    learned_adj_emb_size: 10 # Size of the node embeddings used to compute the static learned graph (A_learned)
+    gat_heads: 2 # Number of attention heads for the dynamic physical graph (GATv2)
+
+# Optional: GAT and Dense Graph Ops are more memory intensive than simple GCN.
+# If you run into OOM errors on your 16GB GPU, uncomment the lines below 
+# to slightly reduce the batch size.
+# training:
+#   batch_size: 20

@@ -58,11 +58,11 @@ dataset:
   target_var: "obs:wind_speed"
 
 training: 
-  batch_size: 26  # around 14.6GB GPU memory usage
+  batch_size: 32
   loss: "MaskedCRPSLogNormal"
   gradient_clip_value: 1.0
   gradient_accumulation_steps: 1  # Accumulate gradients over N steps (effective_batch_size = batch_size * N)
-  epochs: 31
+  epochs: 20
   optim:
     algo: 'Adam'
     kwargs:

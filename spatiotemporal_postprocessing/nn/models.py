@@ -2,12 +2,13 @@ from einops import rearrange
 from einops.layers.torch import Rearrange
 import torch.nn as nn
 import torch
-# import torch.nn.functional as F
+import torch.nn.functional as F
 from typing import Literal
 from tsl.nn.layers import GatedGraphNetwork, NodeEmbedding, BatchNorm
 from tsl.nn.models import GraphWaveNetModel
 from spatiotemporal_postprocessing.nn.probabilistic_layers import dist_to_layer
 from spatiotemporal_postprocessing.nn.prototypes import TCNLayer
+from torch_geometric.nn import GATv2Conv
 
 
 class LayeredGraphRNN(nn.Module):
@@ -210,7 +211,7 @@ class Model0TCN(nn.Module):
                     kernel_size=kernel_size,
                     dilation=dilation,
                     dropout_p=dropout_p,
-                    causal_conv=True  # Ensure no future information leakage (always true)
+                    causal_conv=False  # always bidirectional
                 )
             )
 
@@ -307,45 +308,6 @@ class GraphAttentionLayer(nn.Module):
             out = out.mean(dim=1)
             
         return out
-    
-# If too slow, try this attention version, should be faster (adn hopeful wont impact performace)
-# class GraphAttentionLayer(nn.Module):
-#     """Simplified attention: Single head instead of multi-head - ~3x faster ????"""
-#     def __init__(self, in_features, out_features, dropout_p=0.1):
-#         super().__init__()
-#         self.W = nn.Linear(in_features, out_features, bias=False)
-#         self.a = nn.Parameter(torch.Tensor(out_features, 1))
-#         self.leaky_relu = nn.LeakyReLU(0.2)
-#         self.dropout = nn.Dropout(dropout_p)
-#         nn.init.xavier_uniform_(self.W.weight)
-#         nn.init.xavier_uniform_(self.a)
-        
-#     def forward(self, x, edge_index):
-#         batch_size, num_nodes, _ = x.size()
-#         h = self.W(x)  # [batch, nodes, features]
-        
-#         # Simplified attention: just use source node features
-#         src_idx, dst_idx = edge_index[0], edge_index[1]
-#         alpha = self.leaky_relu((h[:, src_idx] * self.a.t()).sum(dim=-1))
-        
-#         # Softmax per target node
-#         alpha_max = torch.zeros(batch_size, num_nodes, device=x.device)
-#         alpha_max.scatter_reduce_(1, dst_idx.unsqueeze(0).expand(batch_size, -1), 
-#                                    alpha, reduce='amax', include_self=False)
-#         alpha = torch.exp(alpha - alpha_max[:, dst_idx])
-        
-#         alpha_sum = torch.zeros(batch_size, num_nodes, device=x.device)
-#         alpha_sum.scatter_add_(1, dst_idx.unsqueeze(0).expand(batch_size, -1), alpha)
-#         alpha = alpha / (alpha_sum[:, dst_idx] + 1e-10)
-#         alpha = self.dropout(alpha)
-        
-#         # Aggregate
-#         h_agg = torch.zeros(batch_size, num_nodes, h.size(-1), device=x.device)
-#         h_agg.scatter_add_(1, dst_idx.unsqueeze(0).unsqueeze(-1).expand(
-#             batch_size, -1, h.size(-1)), h[:, src_idx] * alpha.unsqueeze(-1))
-        
-#         return h_agg
-
 
 class EnhancedLayeredGraphRNN(nn.Module):
     """
@@ -530,5 +492,185 @@ class EnhancedBiDirectionalSTGNN(nn.Module):
         
         # Hierarchical readout
         output = self.readout(states)
+        
+        return self.output_distr(output)
+
+
+
+"""
+STGNN2
+"""
+
+
+class LearnedGraph(nn.Module):
+    """
+    Learns a static adjacency matrix based on node embeddings.
+    """
+    def __init__(self, n_stations, emb_size=10):
+        super().__init__()
+        self.source_embeddings = NodeEmbedding(n_stations, emb_size)
+        self.target_embeddings = NodeEmbedding(n_stations, emb_size)
+
+    def forward(self):
+        # Calculate A = Softmax(ReLU(E1 @ E2.T))
+        source = self.source_embeddings()
+        target = self.target_embeddings()
+        logits = F.relu(torch.matmul(source, target.transpose(0, 1)))
+        adj = F.softmax(logits, dim=1)
+        return adj
+
+class DualSpatialBlock(nn.Module):
+    """
+    Combines Dynamic Attention (GAT) on physical graph 
+    AND Static Learned Correlations (WaveNet-style) on latent graph.
+    """
+    def __init__(self, in_channels, out_channels, heads=2, dropout=0.2):
+        super().__init__()
+        
+        # Branch 1: Dynamic Attention on Physical Graph
+        self.gat = GATv2Conv(in_channels, out_channels // heads, 
+                             heads=heads, 
+                             dropout=dropout, 
+                             add_self_loops=True)
+        
+        # Branch 2: Static Convolution on Learned Graph
+        self.dense_lin = nn.Linear(in_channels, out_channels)
+
+        # Fusion
+        self.fusion = nn.Linear(out_channels * 2, out_channels)
+        self.act = nn.ReLU()
+
+    def forward(self, x, edge_index, learned_adj):
+        """
+        x: [Batch, Nodes, Features]
+        edge_index: [2, Num_Edges] Physical graph connectivity
+        learned_adj: [Nodes, Nodes] Dense learned matrix
+        """
+        B, N, C = x.shape
+        
+        # --- 1. GAT Branch (Sparse, Dynamic) ---
+        # The standard GATv2Conv expects (Total_Nodes, Features).
+        # We must flatten the batch and repeat the edge_index for each batch element.
+        
+        x_flat = x.view(-1, C) # Shape: [B*N, C]
+        
+        # Vectorized expansion of edge_index for the whole batch
+        src, dst = edge_index
+        # Create offsets: [0, N, 2N, ... ]
+        offsets = torch.arange(B, device=x.device) * N
+        
+        # Broadcast offsets to edges: [B, 1] + [1, E] -> [B, E] -> flatten
+        src_batch = (src.unsqueeze(0) + offsets.unsqueeze(1)).flatten()
+        dst_batch = (dst.unsqueeze(0) + offsets.unsqueeze(1)).flatten()
+        
+        edge_index_batch = torch.stack([src_batch, dst_batch], dim=0)
+        
+        # Apply GAT on the "giant" batched graph
+        gat_out_flat = self.gat(x_flat, edge_index_batch)
+        
+        # Reshape back: [B*N, C] -> [B, N, C]
+        gat_out = gat_out_flat.view(B, N, -1)
+        
+        # --- 2. Learned Graph Branch (Dense, Static) ---
+        # Operation: X' = A_learned @ X @ W
+        # x: [B, N, In], adj: [N, N] -> [B, N, In]
+        # We use einsum to multiply the adjacency for every batch element
+        dense_agg = torch.einsum('nm, bmc -> bnc', learned_adj, x)
+        dense_out = self.dense_lin(dense_agg)
+        
+        # --- 3. Fusion ---
+        combined = torch.cat([gat_out, dense_out], dim=-1)
+        return self.act(self.fusion(combined))
+
+class AttentionTCN_GNN(nn.Module):
+    def __init__(self, num_layers, input_size, output_dist, hidden_channels, 
+                 n_stations, kernel_size=3, dropout_p=0.2, causal_conv=False, 
+                 learned_adj_emb_size=10, gat_heads=2, **kwargs):
+        super().__init__()
+        
+        if isinstance(hidden_channels, int):
+            hidden_channels = [hidden_channels]*num_layers
+            
+        self.rearrange_for_gnn = rearrange 
+        
+        # 1. Embeddings and Encoder
+        self.station_embeddings = NodeEmbedding(n_stations, hidden_channels[0])
+        self.encoder = nn.Linear(input_size, hidden_channels[0])
+        
+        # 2. The Learned Graph Generator (WaveNet style)
+        self.learned_graph_gen = LearnedGraph(n_stations, learned_adj_emb_size)
+
+        # 3. Layers
+        self.tcn_layers = nn.ModuleList()
+        self.spatial_layers = nn.ModuleList()
+        self.norm_layers = nn.ModuleList()
+        
+        for l in range(num_layers):
+            dilation = 2**l
+            in_size = hidden_channels[0] if l == 0 else hidden_channels[l-1]
+            out_size = hidden_channels[l]
+            
+            # TCN (Temporal)
+            self.tcn_layers.append(
+                TCNLayer(in_channels=in_size, out_channels=out_size, 
+                         kernel_size=kernel_size, dilation=dilation, 
+                         dropout_p=dropout_p, causal_conv=causal_conv)
+            )
+            
+            # Dual Spatial (Dynamic Attention + Static Learned)
+            self.spatial_layers.append(
+                DualSpatialBlock(in_channels=out_size, out_channels=out_size, 
+                                 heads=gat_heads, dropout=dropout_p)
+            )
+            
+            self.norm_layers.append(nn.BatchNorm1d(num_features=out_size))
+            
+        # 4. Output Head
+        self.output_distr = dist_to_layer[output_dist](input_size=hidden_channels[-1])
+
+    def forward(self, x, edge_index):
+        # x input: [Batch, LeadTime, Stations, Features]
+        
+        # Encoding
+        x = self.encoder(x)
+        x = x + self.station_embeddings()
+        
+        # Pre-compute the learned adjacency (Static per batch)
+        learned_adj = self.learned_graph_gen()
+        
+        # Rearrange for TCN: [B, T, N, F] -> [(B N), F, T]
+        b, t, n, f = x.shape
+        x = rearrange(x, 'b t n f -> (b n) f t')
+        
+        skips = []
+        
+        for tcn, spatial, norm in zip(self.tcn_layers, self.spatial_layers, self.norm_layers):
+            
+            # 1. Temporal Convolution
+            x, skip = tcn(x)
+            
+            # 2. Reshape for Spatial Interaction
+            # TCN out: [(B N), F, T] -> [B, T, N, F] -> [(B T), N, F]
+            # We fold Batch and Time together for the spatial pass
+            x_spatial = rearrange(x, '(b n) f t -> (b t) n f', b=b, n=n)
+            
+            # 3. Spatial Convolution (Attention + Learned)
+            x_spatial = spatial(x_spatial, edge_index, learned_adj)
+            
+            # 4. Reshape back for Norm and next TCN
+            # [(B T), N, F] -> [B, T, N, F] -> [(B N), F, T]
+            x = rearrange(x_spatial, '(b t) n f -> (b n) f t', b=b)
+            
+            # 5. Norm
+            x = norm(x)
+            
+            skips.append(skip)
+            
+        # Sum skip connections
+        skips_stack = torch.stack(skips, dim=-1) 
+        result = skips_stack.sum(dim=-1) + x 
+        
+        # Final formatting: [(B N), F, T] -> [B, T, N, F]
+        output = rearrange(result, '(b n) f t -> b t n f', b=b)
         
         return self.output_distr(output)

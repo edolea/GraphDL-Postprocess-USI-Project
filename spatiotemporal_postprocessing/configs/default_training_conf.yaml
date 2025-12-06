@@ -57,8 +57,10 @@ dataset:
   - terrain:sn_derivative_100000m
   target_var: "obs:wind_speed"
 
-training: 
-  batch_size: 32
+seed: 42  # Random seed for reproducibility
+
+training:
+  batch_size: 26 # around 14.6 GB gpu memory usage
   loss: "MaskedCRPSLogNormal"
   gradient_clip_value: 1.0
   gradient_accumulation_steps: 1  # Accumulate gradients over N steps (effective_batch_size = batch_size * N)

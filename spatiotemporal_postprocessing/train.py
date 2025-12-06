@@ -125,7 +125,6 @@ def rank_histogram_for_lead(mu_all,
     return hist.cpu()
 
 
-
 @torch.no_grad()
 def evaluate_crps_weighted_over_batches(model,
                 dataloader,
@@ -236,6 +235,7 @@ def evaluate_crps_weighted_over_batches(model,
             crps_at_leads[t] = float("nan")
 
     return crps_mean, crps_at_leads
+
 
 @torch.no_grad()
 def evaluate_crps(
@@ -579,8 +579,9 @@ def app(cfg: DictConfig):
     if os.path.exists("results"):
         shutil.rmtree("results")
     os.makedirs("results")
-    # Set seed for reproducibility
-    set_seed(42)
+
+    seed = cfg.get('seed', 42)
+    set_seed(seed)
     
     if OmegaConf.select(cfg, "training.optim.kwargs.betas") is not None:
         cfg.training.optim.kwargs.betas = eval(cfg.training.optim.kwargs.betas)
@@ -675,8 +676,8 @@ def app(cfg: DictConfig):
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
 
-                # if CUDA_MEM and batch_idx == 1:
-                #     torch.cuda.reset_peak_memory_stats()  # Reset BEFORE processing this batch
+                if CUDA_MEM and batch_idx == 1:
+                    torch.cuda.reset_peak_memory_stats()  # Reset BEFORE processing this batch
                 
                 predictions = model(x_batch, edge_index=edge_index)  
 

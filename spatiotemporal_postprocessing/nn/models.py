@@ -998,90 +998,242 @@ class EfficientDualSpatialBlock(nn.Module):
         
         return self.norm(out)
 
+# class AttentionTCN_GNN(nn.Module):
+#     def __init__(self, num_layers, input_size, output_dist, hidden_channels, 
+#                  n_stations, kernel_size=3, dropout_p=0.2, causal_conv=False, 
+#                  learned_adj_emb_size=10, gat_heads=2, **kwargs):
+#         super().__init__()
+        
+#         if isinstance(hidden_channels, int):
+#             hidden_channels = [hidden_channels]*num_layers
+            
+#         self.station_embeddings = NodeEmbedding(n_stations, hidden_channels[0])
+#         self.encoder = nn.Linear(input_size, hidden_channels[0])
+#         self.learned_graph_gen = LearnedGraph(n_stations, learned_adj_emb_size)
+
+#         self.tcn_layers = nn.ModuleList()
+#         self.spatial_layers = nn.ModuleList()
+        
+#         for l in range(num_layers):
+#             dilation = 2**l
+#             in_size = hidden_channels[0] if l == 0 else hidden_channels[l-1]
+#             out_size = hidden_channels[l]
+            
+#             # TCN Layer (Temporal)
+#             self.tcn_layers.append(
+#                 TCNLayer(in_channels=in_size, out_channels=out_size, 
+#                          kernel_size=kernel_size, dilation=dilation, 
+#                          dropout_p=dropout_p, causal_conv=causal_conv)
+#             )
+            
+#             # Spatial Layer (Spatio-Temporal Mixing)
+#             self.spatial_layers.append(
+#                 EfficientDualSpatialBlock(in_channels=out_size, out_channels=out_size, 
+#                                           heads=gat_heads, dropout=dropout_p)
+#             )
+            
+#             # Note: BatchNorm is removed here because LayerNorm is added 
+#             # inside the Spatial Block, which is generally better for GNNs.
+            
+#         self.output_distr = dist_to_layer[output_dist](input_size=hidden_channels[-1])
+
+#     def forward(self, x, edge_index):
+#         # x: [B, T, N, F]
+#         x = self.encoder(x)
+#         x = x + self.station_embeddings()
+        
+#         learned_adj = self.learned_graph_gen()
+        
+#         B, T, N, C = x.shape
+        
+#         # Efficient Batch Edge Index Construction
+#         src, dst = edge_index
+#         offsets = torch.arange(B * T, device=x.device) * N
+#         src_batch = (src.unsqueeze(0) + offsets.unsqueeze(1)).flatten()
+#         dst_batch = (dst.unsqueeze(0) + offsets.unsqueeze(1)).flatten()
+#         batch_edge_index = torch.stack([src_batch, dst_batch], dim=0)
+        
+#         # TCN requires: [(B N), C, T]
+#         x = rearrange(x, 'b t n c -> (b n) c t')
+        
+#         skips = []
+        
+#         for tcn, spatial in zip(self.tcn_layers, self.spatial_layers):
+            
+#             # 1. Temporal Convolution
+#             x, skip = tcn(x) # Out: [(B N), C, T]
+            
+#             # 2. Reshape for Spatial
+#             # (b n) c t -> (b t) n c
+#             x_spatial = rearrange(x, '(b n) c t -> (b t) n c', b=B, n=N)
+#             x_spatial_flat = x_spatial.reshape(-1, x_spatial.shape[-1]) 
+            
+#             # 3. Spatial Convolution with Residual & Gating
+#             out_spatial = spatial(x_spatial_flat, batch_edge_index, learned_adj, (B*T, N))
+            
+#             # 4. Reshape back
+#             out_spatial = out_spatial.view(B, T, N, -1)
+#             x = rearrange(out_spatial, 'b t n c -> (b n) c t')
+            
+#             # No external Norm here, it's inside the spatial block
+#             skips.append(skip)
+            
+#         # Sum skip connections
+#         output = torch.stack(skips, dim=-1).sum(dim=-1) 
+        
+#         # Final formatting
+#         output = rearrange(output, '(b n) c t -> b t n c', b=B, n=N)
+        
+#         return self.output_distr(output)
+
+
+
+from einops import repeat
+
 class AttentionTCN_GNN(nn.Module):
+    """
+    Refined Architecture incorporating insights:
+    1. Explicit Horizon (Lead Time) Embeddings.
+    2. Lightweight GATv2 for local physical diffusion.
+    3. Global Spatial Transformer for long-range dynamic correlations.
+    4. Input-Injection Gating to preserve raw NWP signals.
+    """
     def __init__(self, num_layers, input_size, output_dist, hidden_channels, 
                  n_stations, kernel_size=3, dropout_p=0.2, causal_conv=False, 
-                 learned_adj_emb_size=10, gat_heads=2, **kwargs):
+                 gat_heads=2, max_lead_time=96, **kwargs):
         super().__init__()
         
         if isinstance(hidden_channels, int):
             hidden_channels = [hidden_channels]*num_layers
             
-        self.station_embeddings = NodeEmbedding(n_stations, hidden_channels[0])
-        self.encoder = nn.Linear(input_size, hidden_channels[0])
-        self.learned_graph_gen = LearnedGraph(n_stations, learned_adj_emb_size)
+        self.hidden_dim = hidden_channels[0]
+        
+        # --- Insight 1: Embeddings ---
+        # Station Embedding (Spatial Identity)
+        self.station_emb = NodeEmbedding(n_stations, self.hidden_dim)
+        # Horizon Embedding (Temporal Identity - Critical for error growth modeling)
+        self.horizon_emb = nn.Embedding(max_lead_time + 1, self.hidden_dim)
+        
+        # Initial Projection
+        self.encoder = nn.Linear(input_size, self.hidden_dim)
 
+        # --- Backbone: Interleaved TCN + Local GNN ---
         self.tcn_layers = nn.ModuleList()
-        self.spatial_layers = nn.ModuleList()
+        self.gat_layers = nn.ModuleList()
+        self.norm_layers = nn.ModuleList()
         
         for l in range(num_layers):
             dilation = 2**l
             in_size = hidden_channels[0] if l == 0 else hidden_channels[l-1]
             out_size = hidden_channels[l]
             
-            # TCN Layer (Temporal)
+            # TCN: Extract temporal features per station
             self.tcn_layers.append(
                 TCNLayer(in_channels=in_size, out_channels=out_size, 
                          kernel_size=kernel_size, dilation=dilation, 
                          dropout_p=dropout_p, causal_conv=causal_conv)
             )
             
-            # Spatial Layer (Spatio-Temporal Mixing)
-            self.spatial_layers.append(
-                EfficientDualSpatialBlock(in_channels=out_size, out_channels=out_size, 
-                                          heads=gat_heads, dropout=dropout_p)
+            # GATv2: Process LOCAL physical neighbors (sparse graph)
+            # We keep this lightweight compared to the previous DualBlock
+            self.gat_layers.append(
+                GATv2Conv(out_size, out_size, heads=gat_heads, 
+                          concat=False, dropout=dropout_p, add_self_loops=True)
             )
             
-            # Note: BatchNorm is removed here because LayerNorm is added 
-            # inside the Spatial Block, which is generally better for GNNs.
+            self.norm_layers.append(nn.LayerNorm(out_size))
             
-        self.output_distr = dist_to_layer[output_dist](input_size=hidden_channels[-1])
+        # --- Insight 2: Global Spatial Refinement ---
+        # After local processing, we let ALL stations talk to EACH OTHER dynamically.
+        # This replaces the static "LearnedGraph".
+        self.global_spatial_attn = nn.MultiheadAttention(
+            embed_dim=self.hidden_dim, 
+            num_heads=4, 
+            batch_first=True, 
+            dropout=dropout_p
+        )
+        self.attn_norm = nn.LayerNorm(self.hidden_dim)
+
+        # --- Insight 3: Gated Input Injection ---
+        self.raw_skip_proj = nn.Linear(input_size, self.hidden_dim)
+        self.gate_generator = nn.Linear(self.hidden_dim, self.hidden_dim)
+
+        # Output
+        self.output_distr = dist_to_layer[output_dist](input_size=self.hidden_dim)
 
     def forward(self, x, edge_index):
         # x: [B, T, N, F]
-        x = self.encoder(x)
-        x = x + self.station_embeddings()
+        B, T, N, F = x.shape
         
-        learned_adj = self.learned_graph_gen()
+        # 1. Embeddings & Encoding
+        h = self.encoder(x) # [B, T, N, H]
         
-        B, T, N, C = x.shape
+        # Add Station Embedding
+        h = h + self.station_emb() # Broadcasting over B and T
         
-        # Efficient Batch Edge Index Construction
+        # Add Horizon Embedding
+        # Create indices [0, 1, ..., T-1] repeated for batch and stations
+        horizon_ids = torch.arange(T, device=x.device)
+        # We need to broadcast this to [B, T, N, H]
+        t_emb = self.horizon_emb(horizon_ids).unsqueeze(0).unsqueeze(2) # [1, T, 1, H]
+        h = h + t_emb
+
+        # 2. Backbone Processing
+        # Prepare for TCN: [(B N), H, T]
+        h_tcn = rearrange(h, 'b t n c -> (b n) c t')
+        
+        # Prepare Batch Edge Index for GAT (Pre-computed once)
         src, dst = edge_index
         offsets = torch.arange(B * T, device=x.device) * N
         src_batch = (src.unsqueeze(0) + offsets.unsqueeze(1)).flatten()
         dst_batch = (dst.unsqueeze(0) + offsets.unsqueeze(1)).flatten()
         batch_edge_index = torch.stack([src_batch, dst_batch], dim=0)
-        
-        # TCN requires: [(B N), C, T]
-        x = rearrange(x, 'b t n c -> (b n) c t')
-        
+
         skips = []
         
-        for tcn, spatial in zip(self.tcn_layers, self.spatial_layers):
+        for tcn, gat, norm in zip(self.tcn_layers, self.gat_layers, self.norm_layers):
             
-            # 1. Temporal Convolution
-            x, skip = tcn(x) # Out: [(B N), C, T]
+            # Temporal Step
+            h_tcn, skip = tcn(h_tcn) # [(B N), H, T]
             
-            # 2. Reshape for Spatial
-            # (b n) c t -> (b t) n c
-            x_spatial = rearrange(x, '(b n) c t -> (b t) n c', b=B, n=N)
-            x_spatial_flat = x_spatial.reshape(-1, x_spatial.shape[-1]) 
+            # Reshape for Spatial Step: flatten B and T into one "batch" dim
+            # [(B N), H, T] -> [(B T), N, H]
+            h_spatial = rearrange(h_tcn, '(b n) c t -> (b t) n c', b=B, n=N)
+            h_spatial_flat = h_spatial.reshape(-1, self.hidden_dim) # [(B T N), H]
             
-            # 3. Spatial Convolution with Residual & Gating
-            out_spatial = spatial(x_spatial_flat, batch_edge_index, learned_adj, (B*T, N))
+            # Physical Graph Step (Local Diffusion)
+            h_gat = gat(h_spatial_flat, batch_edge_index)
             
-            # 4. Reshape back
-            out_spatial = out_spatial.view(B, T, N, -1)
-            x = rearrange(out_spatial, 'b t n c -> (b n) c t')
+            # Residual + Norm
+            h_gat = h_gat.view(B*T, N, -1)
+            h_spatial = norm(h_spatial + h_gat) # Residual connection crucial here
             
-            # No external Norm here, it's inside the spatial block
+            # Back to TCN shape
+            h_tcn = rearrange(h_spatial, '(b t) n c -> (b n) c t', b=B, t=T)
+            
             skips.append(skip)
-            
-        # Sum skip connections
-        output = torch.stack(skips, dim=-1).sum(dim=-1) 
+
+        # Sum WaveNet skips
+        h_deep = torch.stack(skips, dim=-1).sum(dim=-1) # [(B N), H, T]
+        h_deep = rearrange(h_deep, '(b n) h t -> (b t) n h', b=B, n=N) # [(B T), N, H]
+
+        # 3. Global Spatial Refinement (Transformer)
+        # Allows distant stations to correct each other dynamically
+        # Query=Key=Value=h_deep
+        attn_out, _ = self.global_spatial_attn(h_deep, h_deep, h_deep)
+        h_refined = self.attn_norm(h_deep + attn_out)
+
+        # 4. Gated Input Injection
+        # Reshape to [B, T, N, H]
+        h_refined = rearrange(h_refined, '(b t) n h -> b t n h', b=B, t=T)
         
-        # Final formatting
-        output = rearrange(output, '(b n) c t -> b t n c', b=B, n=N)
+        # Compute Gate
+        gate = torch.sigmoid(self.gate_generator(h_refined))
         
-        return self.output_distr(output)
+        # Skip projection of raw input
+        raw_proj = self.raw_skip_proj(x)
+        
+        # Final fusion: Blend deep features with raw input features
+        h_final = gate * h_refined + (1 - gate) * raw_proj
+
+        return self.output_distr(h_final)

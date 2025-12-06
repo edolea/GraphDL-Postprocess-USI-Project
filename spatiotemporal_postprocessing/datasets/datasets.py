@@ -87,7 +87,7 @@ def get_graph(lat, lon, knn=10, threshold=None):
         return distance
     n = lat.shape[0]
     dist = np.zeros((n,n))
-    for i in tqdm(range(n), desc="Outer Loop Progress"):
+    for i in tqdm(range(n), desc="Dist Computing Progress"):
         for j in tqdm(range(i, n), desc=f"Inner Loop Progress (i={i})", leave=False):
             s1_lon = lon[i]
             s1_lat = lat[i]

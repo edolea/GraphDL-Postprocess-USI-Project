@@ -1,12 +1,7 @@
-defaults:
-  - _self_
-  - override hydra/hydra_logging: disabled
-  - override hydra/job_logging: disabled
-
 hydra:
   run:
     dir: ./
-  output_subdir: ./artifacts
+  output_subdir: ./
 
 nwp_model: ch2  # Can only be ch2 for this project
 d_map:
@@ -14,7 +9,7 @@ d_map:
 
 data_base_folder: ${oc.env:DATA_BASE_FOLDER}
 
-model:
+model: 
   type: "TCN_GNN"
   kwargs:
     num_layers: 4
@@ -57,20 +52,18 @@ dataset:
   - terrain:sn_derivative_100000m
   target_var: "obs:wind_speed"
 
-seed: 42  # Random seed for reproducibility
-
-training:
-  batch_size: 26 # around 14.6 GB gpu memory usage
+training: 
+  batch_size: 32
   loss: "MaskedCRPSLogNormal"
   gradient_clip_value: 1.0
-  gradient_accumulation_steps: 1  # Accumulate gradients over N steps (effective_batch_size = batch_size * N)
-  epochs: 20
+  epochs: 100
   optim:
     algo: 'Adam'
     kwargs:
       betas: "(0.9, 0.999)"
       lr: 0.0001
 
+    
   scheduler:
     algo: 'CosineAnnealingWarmRestarts'
     kwargs: 
@@ -83,4 +76,5 @@ logging:
   mlflow_tracking_uri: mlruns # if local
 
   experiment_id: stgnn_wind_postproc
-  run_name: null  # Set to a custom name or leave null for auto-generated names
+  
+  

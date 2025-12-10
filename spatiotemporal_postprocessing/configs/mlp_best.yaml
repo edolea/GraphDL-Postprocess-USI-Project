@@ -1,0 +1,17 @@
+defaults:
+- default_training_conf.yaml
+- _self_
+model:
+  type: MLP
+  kwargs:
+    hidden_sizes: (128,64,64)
+    dropout_p: 0.10193091799165682
+    output_dist: LogNormal
+    hidden_channels: 64
+    num_layers: 2
+training:
+  optim:
+    kwargs:
+      lr: 0.0008718383855080231
+  batch_size: 64
+seed: 42

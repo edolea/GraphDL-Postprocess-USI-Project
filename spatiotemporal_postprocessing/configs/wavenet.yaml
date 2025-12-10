@@ -12,6 +12,6 @@ model:
     output_dist: LogNormal
 
 training:
-optim:
-  kwargs:
-    lr: 0.0001
+  optim:
+    kwargs:
+      lr: 0.0001

@@ -1,0 +1,17 @@
+defaults:
+- default_training_conf.yaml
+model:
+  type: Model0TCN
+  kwargs:
+    hidden_channels: 128
+    num_layers: 2
+    kernel_size: 3
+    dropout_p: 0.37624405333957195
+    output_dist: LogNormal
+training:
+  optim:
+    kwargs:
+      lr: 0.0008737181984476959
+  batch_size: 64
+
+seed: 42

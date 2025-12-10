@@ -1,0 +1,23 @@
+defaults: 
+  - default_training_conf.yaml
+
+model: 
+  type: "BiDirectionalSTGNN"
+  kwargs: 
+    hidden_size: 64
+    n_layers: 2
+    dropout_p: 0.415790826527786
+    output_dist: LogNormal
+    # Explicitly remove default model params
+    num_layers: null
+    hidden_channels: null
+    kernel_size: null
+    causal_conv: null
+
+training:
+  optim:
+    algo: 'RMSprop'
+    kwargs:
+      lr: 0.00031909296713743696
+      momentum: 0.5
+  batch_size: 32

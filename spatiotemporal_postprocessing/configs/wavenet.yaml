@@ -10,3 +10,8 @@ model:
     num_layers: 4
     spatial_kernel_size: 3
     output_dist: LogNormal
+
+training:
+optim:
+  kwargs:
+    lr: 0.0001

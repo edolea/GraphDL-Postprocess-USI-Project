@@ -3,6 +3,8 @@ hydra:
     dir: ./
   output_subdir: ./
 
+seed: 42
+
 nwp_model: ch2  # Can only be ch2 for this project
 d_map:
   ch2: 96
@@ -56,7 +58,8 @@ training:
   batch_size: 32
   loss: "MaskedCRPSLogNormal"
   gradient_clip_value: 1.0
-  epochs: 100
+  gradient_accumulation_steps: 1  # Accumulate gradients over N steps (effective_batch_size = batch_size * N)
+  epochs: 31
   optim:
     algo: 'Adam'
     kwargs:
@@ -76,5 +79,4 @@ logging:
   mlflow_tracking_uri: mlruns # if local
 
   experiment_id: stgnn_wind_postproc
-  
-  
+  run_name: null

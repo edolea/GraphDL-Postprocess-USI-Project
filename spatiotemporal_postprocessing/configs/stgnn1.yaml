@@ -7,7 +7,7 @@ model:
     hidden_size: 64
     num_layers: 1
     dropout_p: 0.2
-    num_heads: 4
+    num_heads: 2
     output_dist: LogNormal
 
 training: 
@@ -16,3 +16,5 @@ training:
       lr: 0.00008
       momentum: 0.5
       weight_decay: 0.0001
+    
+    batch_size: 16

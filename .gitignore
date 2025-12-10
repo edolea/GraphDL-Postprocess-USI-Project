@@ -1,5 +1,6 @@
 help.sh
 results/
+tuning/
 
 # Mlflow
 mlruns

@@ -7,3 +7,8 @@ model:
     hidden_sizes: "(128,64,64)"
     dropout_p: 0.2
     output_dist: LogNormal
+
+training:
+    optim:
+      kwargs:
+        lr: 0.0001

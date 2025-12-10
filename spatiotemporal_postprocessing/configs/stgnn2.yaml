@@ -13,5 +13,11 @@ model:
     learned_adj_emb_size: 10 # Size of the node embeddings used to compute the static learned graph (A_learned)
     gat_heads: 2 # Number of attention heads for the dynamic physical graph (GATv2)
 
-# training:
-#   batch_size: 20
+# Optional: GAT and Dense Graph Ops are more memory intensive than simple GCN.
+# If you run into OOM errors on your 16GB GPU, uncomment the lines below 
+# to slightly reduce the batch size.
+training:
+  optim:
+    kwargs:
+      lr: 0.0001
+  batch_size: 32 # around 13.9 GB

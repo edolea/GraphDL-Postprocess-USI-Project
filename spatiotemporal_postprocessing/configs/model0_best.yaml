@@ -13,6 +13,6 @@ training:
     kwargs:
       lr: 0.0008737181984476959
   batch_size: 128
-  epochs: 101
+  epochs: 100
 
 seed: 42

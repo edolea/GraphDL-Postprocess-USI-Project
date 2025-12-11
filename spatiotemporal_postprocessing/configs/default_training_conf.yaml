@@ -64,7 +64,7 @@ training:
   loss: "MaskedCRPSLogNormal"
   gradient_clip_value: 1.0
   gradient_accumulation_steps: 1  # Accumulate gradients over N steps (effective_batch_size = batch_size * N)
-  epochs: 31
+  epochs: 50
   optim:
     algo: 'Adam'
     kwargs:

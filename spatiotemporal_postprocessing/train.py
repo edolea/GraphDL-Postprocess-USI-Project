@@ -668,15 +668,15 @@ def app(cfg: DictConfig):
         # Early stopping variables
         best_val_loss = float('inf')
         epochs_without_improvement = 0
-        patience = 10
+        patience = 15
         val_loss_history = []  # Track recent validation losses for moving average
-        window_size = 5  # Compare average of last 5 epochs
+        window_size = 10  # Compare average of last 5 epochs
         min_delta = 1e-5  # Minimum improvement to be considered significant
         best_model_state = None  # Store best model weights
         
         total_iter = 0
         loss_str = ""
-        epoch_pbar = tqdm(range(epochs), desc="Epochs")
+        epoch_pbar = tqdm(range(1, epochs+1), desc="Epochs")
         for epoch in epoch_pbar:
             model.train()
             total_loss = 0.0

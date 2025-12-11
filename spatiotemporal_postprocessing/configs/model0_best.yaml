@@ -12,6 +12,7 @@ training:
   optim:
     kwargs:
       lr: 0.0008737181984476959
-  batch_size: 64
+  batch_size: 128
+  epochs: 101
 
 seed: 42

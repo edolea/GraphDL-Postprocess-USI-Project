@@ -574,266 +574,336 @@ def set_seed(seed=42):
 OmegaConf.register_new_resolver("add_one", lambda x: int(x) + 1)
 OmegaConf.register_new_resolver("oc.env_or", lambda var_name, default_value: os.getenv(var_name, default_value))
 
-@hydra.main(version_base="1.1", config_path="./configs", config_name="default_training_conf")
-def app(cfg: DictConfig):
-    if os.path.exists("results"):
-        shutil.rmtree("results")
-    os.makedirs("results")
 
-    seed = cfg.get('seed', 42)
-    set_seed(seed)
+def train_with_config(cfg: DictConfig, trial=None):
+    """
+    Core training function that can be used by both standalone training and Optuna tuning.
     
-    if OmegaConf.select(cfg, "training.optim.kwargs.betas") is not None:
-        cfg.training.optim.kwargs.betas = eval(cfg.training.optim.kwargs.betas)
-    if 'hidden_sizes' in cfg.model.kwargs:
-        cfg.model.kwargs.hidden_sizes = eval(cfg.model.kwargs.hidden_sizes) 
+    Parameters
+    ----------
+    cfg : DictConfig
+        Hydra configuration object
+    trial : optuna.Trial, optional
+        Optuna trial object for hyperparameter tuning. If provided, will report
+        validation metrics and check for pruning.
     
-    print(cfg)
-    predictor_names = list(cfg.dataset.predictors)
-    lead_hours_limit = int(cfg.dataset.hours_leadtime)
+    Returns
+    -------
+    best_val_loss : float
+        Best validation loss (original range) achieved during training.
+        Returns float('inf') if training fails.
+    """
     try:
-        nwp_mean_idx = predictor_names.index(f"{cfg.nwp_model}:wind_speed_ensavg")
-        nwp_std_idx = predictor_names.index(f"{cfg.nwp_model}:wind_speed_ensstd")
-    except ValueError as exc:
-        raise ValueError("NWP mean/std predictors not found in dataset configuration.") from exc
+        if os.path.exists("results"):
+            shutil.rmtree("results")
+        os.makedirs("results")
 
-    ds = xr.open_dataset(cfg.dataset.features_pth)
-    ds_targets = xr.open_dataset(cfg.dataset.targets_pth)
-
-    dm = get_datamodule(ds=ds, 
-                        ds_targets=ds_targets,
-                        val_split=cfg.dataset.val_split,
-                        test_start_date=cfg.dataset.test_start,
-                        train_val_end_date=cfg.dataset.train_val_end,
-                        lead_time_hours=cfg.dataset.hours_leadtime,
-                        predictors=cfg.dataset.predictors, 
-                        target_var=cfg.dataset.target_var,
-                        return_graph=True, graph_kwargs=cfg.graph_kwargs)
-    print(dm)
-
-    adj_matrix = dm.adj_matrix
-    edge_index, edge_weight = adj_to_edge_index(adj=torch.tensor(adj_matrix)) # NOTE not using w_ij for now
-    
-    
-    batch_size = cfg.training.batch_size
-    train_dataloader = DataLoader(dm.train_dataset, batch_size=batch_size, shuffle=True)
-    val_dataloader = DataLoader(dm.val_dataset, batch_size=batch_size, shuffle=True)
-    test_dataloader = DataLoader(dm.test_dataset, batch_size=batch_size, shuffle=False)
-    
-    assert dm.train_dataset.stations == dm.val_dataset.stations == dm.test_dataset.stations # sanity check 
-    
-    # MODEL LOAD
-    model_kwargs = {'input_size': dm.train_dataset.f, 
-                    'n_stations': dm.train_dataset.stations,
-                    **cfg.model.kwargs} 
-    model = get_model(model_type=cfg.model.type, **model_kwargs)
-    
-    epochs = cfg.training.epochs
-    criterion = get_loss(cfg.training.loss)
-    optimizer = getattr(torch.optim, cfg.training.optim.algo)(model.parameters(), **cfg.training.optim.kwargs)
-    lr_scheduler = getattr(torch.optim.lr_scheduler, cfg.training.scheduler.algo)(optimizer, **cfg.training.scheduler.kwargs)
-    gradient_clip_value = cfg.training.gradient_clip_value
-    gradient_accumulation_steps = cfg.training.get('gradient_accumulation_steps', 1)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device_type = "cuda" if torch.cuda.is_available() else "cpu"
-    model = model.to(device)
-    edge_index = edge_index.to(device)
-
-    # Set DagHub credentials BEFORE setting tracking URI
-    if "dagshub.com" in cfg.logging.mlflow_tracking_uri:
-        dagshub_token = os.getenv("MLFLOW_TRACKING_TOKEN") or os.getenv("DAGSHUB_TOKEN")
-        dagshub_username = os.getenv("MLFLOW_TRACKING_USERNAME") or os.getenv("DAGSHUB_USER_NAME")
-
-    mlflow.set_tracking_uri(cfg.logging.mlflow_tracking_uri)
-    mlflow.set_experiment(experiment_name=cfg.logging.experiment_id)
-    
-    run_name = OmegaConf.select(cfg, "logging.run_name")
-    if run_name is None or run_name == "null":
-        run_name = None  # MLflow will auto-generate a name
-
-    if device_type == 'cpu':
-        print("######### WARNING: GPU NOT IN USE ##########")
-        torch.set_num_threads(16)
-    
-    with mlflow.start_run(run_name=run_name):
-        mlflow.log_param("device_type", device_type)
-        mlflow.log_param("optimizer", type(optimizer).__name__) 
-        mlflow.log_param("criterion", type(criterion).__name__) 
-        mlflow.log_param("num_params", sum(p.numel() for p in model.parameters() if p.requires_grad))
-        cfg_dict = OmegaConf.to_container(cfg, resolve=True)
-        mlflow.log_dict(cfg_dict, 'training_config.json')
-        mlflow.log_params(cfg_dict)
+        seed = cfg.get('seed', 42)
+        set_seed(seed)
         
-        total_iter = 0
-        loss_str = ""
-        epoch_pbar = tqdm(range(epochs), desc="Epochs")
-        for epoch in epoch_pbar:
-            model.train()
-            total_loss = 0.0
+        if OmegaConf.select(cfg, "training.optim.kwargs.betas") is not None:
+            betas_val = cfg.training.optim.kwargs.betas
+            if isinstance(betas_val, str):
+                cfg.training.optim.kwargs.betas = eval(betas_val)
+        if 'hidden_sizes' in cfg.model.kwargs:
+            hidden_sizes_val = cfg.model.kwargs.hidden_sizes
+            if isinstance(hidden_sizes_val, str):
+                cfg.model.kwargs.hidden_sizes = eval(hidden_sizes_val) 
+        
+        if trial is None:
+            print(cfg)
+        predictor_names = list(cfg.dataset.predictors)
+        lead_hours_limit = int(cfg.dataset.hours_leadtime)
+        try:
+            nwp_mean_idx = predictor_names.index(f"{cfg.nwp_model}:wind_speed_ensavg")
+            nwp_std_idx = predictor_names.index(f"{cfg.nwp_model}:wind_speed_ensstd")
+        except ValueError as exc:
+            raise ValueError("NWP mean/std predictors not found in dataset configuration.") from exc
 
-            for batch_idx, (x_batch, y_batch) in tqdm(enumerate(train_dataloader), desc="Training Batches", total=len(train_dataloader), leave=False):
-                x_batch = x_batch.to(device)
-                y_batch = y_batch.to(device)
+        ds = xr.open_dataset(cfg.dataset.features_pth)
+        ds_targets = xr.open_dataset(cfg.dataset.targets_pth)
 
-                if CUDA_MEM and batch_idx == 1:
-                    torch.cuda.reset_peak_memory_stats()  # Reset BEFORE processing this batch
-                
-                predictions = model(x_batch, edge_index=edge_index)  
+        dm = get_datamodule(ds=ds, 
+                            ds_targets=ds_targets,
+                            val_split=cfg.dataset.val_split,
+                            test_start_date=cfg.dataset.test_start,
+                            train_val_end_date=cfg.dataset.train_val_end,
+                            lead_time_hours=cfg.dataset.hours_leadtime,
+                            predictors=cfg.dataset.predictors, 
+                            target_var=cfg.dataset.target_var,
+                            return_graph=True, graph_kwargs=cfg.graph_kwargs)
+        if trial is None:
+            print(dm)
 
-                loss = criterion(predictions, y_batch)
-                # Scale loss by accumulation steps to maintain consistent gradient magnitude
-                loss = loss / gradient_accumulation_steps
-                loss.backward()  
-                
-                # Only update weights every gradient_accumulation_steps
-                if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_dataloader):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_value)
-                    optimizer.step()
-                    optimizer.zero_grad()
-                
-                if CUDA_MEM and batch_idx == 1:
-                    print(f"Epoch {epoch}, Batch {batch_idx}")
-                    print("x_batch shape:", x_batch.shape)
-                    print("Peak memory allocated (MB):", torch.cuda.max_memory_allocated() / 1e6)
-                    # print("Current memory allocated (MB):", torch.cuda.memory_allocated() / 1e6)
-                
-                total_loss += loss.item() * gradient_accumulation_steps  # Rescale for logging
+        adj_matrix = dm.adj_matrix
+        edge_index, edge_weight = adj_to_edge_index(adj=torch.tensor(adj_matrix)) # NOTE not using w_ij for now
+        
+        
+        batch_size = cfg.training.batch_size
+        train_dataloader = DataLoader(dm.train_dataset, batch_size=batch_size, shuffle=True)
+        val_dataloader = DataLoader(dm.val_dataset, batch_size=batch_size, shuffle=True)
+        test_dataloader = DataLoader(dm.test_dataset, batch_size=batch_size, shuffle=False)
+        
+        assert dm.train_dataset.stations == dm.val_dataset.stations == dm.test_dataset.stations # sanity check 
+        
+        # MODEL LOAD
+        model_kwargs = {'input_size': dm.train_dataset.f, 
+                        'n_stations': dm.train_dataset.stations,
+                        **cfg.model.kwargs} 
+        model = get_model(model_type=cfg.model.type, **model_kwargs)
+        
+        epochs = cfg.training.epochs
+        criterion = get_loss(cfg.training.loss)
+        
+        # Filter optimizer kwargs to only include valid parameters for the selected optimizer
+        import inspect
+        optimizer_class = getattr(torch.optim, cfg.training.optim.algo)
+        valid_params = inspect.signature(optimizer_class.__init__).parameters.keys()
+        filtered_kwargs = {k: v for k, v in cfg.training.optim.kwargs.items() if k in valid_params}
+        optimizer = optimizer_class(model.parameters(), **filtered_kwargs)
+        
+        lr_scheduler = getattr(torch.optim.lr_scheduler, cfg.training.scheduler.algo)(optimizer, **cfg.training.scheduler.kwargs)
+        gradient_clip_value = cfg.training.gradient_clip_value
+        gradient_accumulation_steps = cfg.training.get('gradient_accumulation_steps', 1)
 
-                if total_iter % 25 == 0:
-                    mlflow.log_metric("loss", loss.item() * gradient_accumulation_steps, step=total_iter)
-                
-                total_iter += 1
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.to(device)
+        edge_index = edge_index.to(device)
 
-            avg_loss = total_loss / len(train_dataloader)
+        # Set DagHub credentials BEFORE setting tracking URI
+        if "dagshub.com" in cfg.logging.mlflow_tracking_uri:
+            dagshub_token = os.getenv("MLFLOW_TRACKING_TOKEN") or os.getenv("DAGSHUB_TOKEN")
+            dagshub_username = os.getenv("MLFLOW_TRACKING_USERNAME") or os.getenv("DAGSHUB_USER_NAME")
+
+        mlflow.set_tracking_uri(cfg.logging.mlflow_tracking_uri)
+        mlflow.set_experiment(experiment_name=cfg.logging.experiment_id)
+        
+        run_name = OmegaConf.select(cfg, "logging.run_name")
+        if run_name is None or run_name == "null":
+            run_name = None  # MLflow will auto-generate a name
+
+        if device_type == 'cpu':
+            print("######### WARNING: GPU NOT IN USE ##########")
+            torch.set_num_threads(16)
+        
+        # Track best validation loss for returning to Optuna
+        best_val_loss = float('inf')
+        
+        with mlflow.start_run(run_name=run_name):
+            mlflow.log_param("device_type", device_type)
+            mlflow.log_param("optimizer", type(optimizer).__name__) 
+            mlflow.log_param("criterion", type(criterion).__name__) 
+            mlflow.log_param("num_params", sum(p.numel() for p in model.parameters() if p.requires_grad))
+            cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+            mlflow.log_dict(cfg_dict, 'training_config.json')
+            mlflow.log_params(cfg_dict)
             
-            mlflow.log_metric("train_loss", avg_loss, step=epoch)
+            # Log trial information if using Optuna
+            if trial is not None:
+                mlflow.log_param("optuna_trial_number", trial.number)
             
-            lr_scheduler.step(epoch=epoch) # TODO make this generic (not all lr_sched use the epoch as param)
-            for group, lr in enumerate(lr_scheduler.get_last_lr()):
-                mlflow.log_metric(f'lr_{group}', lr, step=epoch)
-            
-            # VALIDATION LOOP
-            val_loss = 0
-            val_loss_original_range = 0
-            model.eval()
-            with torch.no_grad():
-                tgt_denormalizer = dm.val_dataset.target_denormalizer #NOTE: this is no-op --> should double check
-                for batch_idx, (x_batch, y_batch) in tqdm(enumerate(val_dataloader), desc="Validation Batches", total=len(val_dataloader), leave=False):
+            total_iter = 0
+            loss_str = ""
+            epoch_pbar = tqdm(range(epochs), desc="Epochs", disable=trial is not None)
+            for epoch in epoch_pbar:
+                model.train()
+                total_loss = 0.0
+
+                for batch_idx, (x_batch, y_batch) in tqdm(enumerate(train_dataloader), desc="Training Batches", total=len(train_dataloader), leave=False, disable=trial is not None):
                     x_batch = x_batch.to(device)
                     y_batch = y_batch.to(device)
+
+                    if CUDA_MEM and batch_idx == 1:
+                        torch.cuda.reset_peak_memory_stats()  # Reset BEFORE processing this batch
+                    
                     predictions = model(x_batch, edge_index=edge_index)  
 
-                    val_loss += criterion(predictions, y_batch).item()
-                    val_loss_original_range += criterion(tgt_denormalizer(predictions), tgt_denormalizer(y_batch)).item()
-                    # val_loss_original_range += criterion(predictions, y_batch).item()
+                    loss = criterion(predictions, y_batch)
+                    # Scale loss by accumulation steps to maintain consistent gradient magnitude
+                    loss = loss / gradient_accumulation_steps
+                    loss.backward()  
                     
-            avg_val_loss = val_loss / len(val_dataloader)
-            avg_val_loss_or = val_loss_original_range / len(val_dataloader)
+                    # Only update weights every gradient_accumulation_steps
+                    if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_dataloader):
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_value)
+                        optimizer.step()
+                        optimizer.zero_grad()
+                    
+                    if CUDA_MEM and batch_idx == 1:
+                        print(f"Epoch {epoch}, Batch {batch_idx}")
+                        print("x_batch shape:", x_batch.shape)
+                        print("Peak memory allocated (MB):", torch.cuda.max_memory_allocated() / 1e6)
+                        # print("Current memory allocated (MB):", torch.cuda.memory_allocated() / 1e6)
+                    
+                    total_loss += loss.item() * gradient_accumulation_steps  # Rescale for logging
 
-            # Update progress bar with metrics
-            epoch_pbar.set_postfix({
-                'train_loss': f'{avg_loss:.4f}',
-                'val_loss': f'{avg_val_loss:.4f}'
-            })
-            loss_str += f"Epoch {epoch}: Train Loss = {avg_loss:.4f}, Val Loss = {avg_val_loss:.4f}\n"
+                    if total_iter % 25 == 0 and trial is None:
+                        mlflow.log_metric("loss", loss.item() * gradient_accumulation_steps, step=total_iter)
+                    
+                    total_iter += 1
 
-            mlflow.log_metric("val_loss", avg_val_loss, step=epoch)
-            mlflow.log_metric("val_loss_original_range", avg_val_loss_or, step=epoch)
-            
-            # Optional plotting
-            if epoch % 10 == 0:
+                avg_loss = total_loss / len(train_dataloader)
+                
+                mlflow.log_metric("train_loss", avg_loss, step=epoch)
+                
+                lr_scheduler.step(epoch=epoch) # TODO make this generic (not all lr_sched use the epoch as param)
+                for group, lr in enumerate(lr_scheduler.get_last_lr()):
+                    mlflow.log_metric(f'lr_{group}', lr, step=epoch)
+                
+                # VALIDATION LOOP
+                val_loss = 0
+                val_loss_original_range = 0
+                model.eval()
                 with torch.no_grad():
-                    x_val_batch, y_val_batch = next(iter(val_dataloader))  
-                    x_val_batch = x_val_batch.to(device)
-                    y_val_batch = y_val_batch.to(device)
-                    val_predictions = model(x_val_batch, edge_index=edge_index)  
-                    
-                    log_prediction_plots(x=x_val_batch, 
-                                        y=y_val_batch, 
-                                        pred_dist=val_predictions, 
-                                        example_indices=[0,0,0,0], 
-                                        stations=[1,2,3,4],
-                                        epoch=epoch,
-                                        input_denormalizer=dm.val_dataset.input_denormalizer)
+                    tgt_denormalizer = dm.val_dataset.target_denormalizer #NOTE: this is no-op --> should double check
+                    for batch_idx, (x_batch, y_batch) in tqdm(enumerate(val_dataloader), desc="Validation Batches", total=len(val_dataloader), leave=False, disable=trial is not None):
+                        x_batch = x_batch.to(device)
+                        y_batch = y_batch.to(device)
+                        predictions = model(x_batch, edge_index=edge_index)  
 
-        print("\n",   loss_str, "\n")
-        mlflow.log_text(loss_str, "training_loss_history.txt")
-        with open(os.path.join("results", "training_loss_history.txt"), "w") as f:
-            f.write(loss_str)
+                        val_loss += criterion(predictions, y_batch).item()
+                        val_loss_original_range += criterion(tgt_denormalizer(predictions), tgt_denormalizer(y_batch)).item()
+                        # val_loss_original_range += criterion(predictions, y_batch).item()
+                        
+                avg_val_loss = val_loss / len(val_dataloader)
+                avg_val_loss_or = val_loss_original_range / len(val_dataloader)
+                
+                # Track best validation loss
+                if avg_val_loss_or < best_val_loss:
+                    best_val_loss = avg_val_loss_or
 
-        ## TEST LOOP
-        result_str = evaluaate_crps_with_nwp_baseline(
-            model=model,
-            dataloader=test_dataloader,
-            device=device,
-            test_crps_metric = get_loss("MaskedCRPSLogNormal"),
-            test_mae_metric = get_loss("MaskedL1Loss"),
-            input_denormalizer=dm.test_dataset.input_denormalizer,
-            target_denormalizer=dm.test_dataset.target_denormalizer, #no-op
-            nwp_mean_idx=nwp_mean_idx,
-            nwp_std_idx=nwp_std_idx,
-            edge_index=edge_index,
-        )
-        print(result_str)
-        mlflow.log_text(result_str, "test_results.txt")
-        with open(os.path.join("results", "test_results.txt"), "w") as f:
-            f.write(result_str)
-        
-        ## TALAGRAND DIAGRAM
-        # Collect model outputs on TEST set
-        mu_all, sigma_all, targets_all = collect_model_outputs(
-            model=model,
-            data_loader=test_dataloader,
-            device=device,
-            edge_index=edge_index,
-        )
+                # Update progress bar with metrics
+                epoch_pbar.set_postfix({
+                    'train_loss': f'{avg_loss:.4f}',
+                    'val_loss': f'{avg_val_loss:.4f}'
+                })
+                loss_str += f"Epoch {epoch}: Train Loss = {avg_loss:.4f}, Val Loss = {avg_val_loss:.4f}\n"
 
-        lead_hours_to_plot = {1, 24, 48, 96}
-        histograms = {}
-        ml_text_talagrand = ""
+                mlflow.log_metric("val_loss", avg_val_loss, step=epoch)
+                mlflow.log_metric("val_loss_original_range", avg_val_loss_or, step=epoch)
+                
+                # Report to Optuna and check for pruning
+                if trial is not None:
+                    import optuna
+                    trial.report(avg_val_loss_or, epoch)
+                    if trial.should_prune():
+                        raise optuna.TrialPruned()
+                
+                # Optional plotting
+                if epoch % 10 == 0 and trial is None:
+                    with torch.no_grad():
+                        x_val_batch, y_val_batch = next(iter(val_dataloader))  
+                        x_val_batch = x_val_batch.to(device)
+                        y_val_batch = y_val_batch.to(device)
+                        val_predictions = model(x_val_batch, edge_index=edge_index)  
+                        
+                        log_prediction_plots(x=x_val_batch, 
+                                            y=y_val_batch, 
+                                            pred_dist=val_predictions, 
+                                            example_indices=[0,0,0,0], 
+                                            stations=[1,2,3,4],
+                                            epoch=epoch,
+                                            input_denormalizer=dm.val_dataset.input_denormalizer)
 
-        for lead_hour in tqdm(lead_hours_to_plot, desc="Computing Talagrand Histograms"):
-            hist = rank_histogram_for_lead(
-                mu_all=mu_all,
-                sigma_all=sigma_all,
-                targets_all=targets_all,
+            print("\n",   loss_str, "\n")
+            mlflow.log_text(loss_str, "training_loss_history.txt")
+            with open(os.path.join("results", "training_loss_history.txt"), "w") as f:
+                f.write(loss_str)
+
+            # Skip test evaluation and Talagrand diagrams if tuning
+            if trial is not None:
+                return best_val_loss
+
+            ## TEST LOOP
+            result_str = evaluaate_crps_with_nwp_baseline(
+                model=model,
+                dataloader=test_dataloader,
                 device=device,
-                n_samples=20,
+                test_crps_metric = get_loss("MaskedCRPSLogNormal"),
+                test_mae_metric = get_loss("MaskedL1Loss"),
+                input_denormalizer=dm.test_dataset.input_denormalizer,
+                target_denormalizer=dm.test_dataset.target_denormalizer, #no-op
+                nwp_mean_idx=nwp_mean_idx,
+                nwp_std_idx=nwp_std_idx,
+                edge_index=edge_index,
+            )
+            print(result_str)
+            mlflow.log_text(result_str, "test_results.txt")
+            with open(os.path.join("results", "test_results.txt"), "w") as f:
+                f.write(result_str)
+            
+            ## TALAGRAND DIAGRAM
+            # Collect model outputs on TEST set
+            mu_all, sigma_all, targets_all = collect_model_outputs(
+                model=model,
+                data_loader=test_dataloader,
+                device=device,
+                edge_index=edge_index,
             )
 
-            histograms[lead_hour] = hist
+            lead_hours_to_plot = {1, 24, 48, 96}
+            histograms = {}
+            ml_text_talagrand = ""
 
-            # print(f"Lead t={lead_hour}: total cases = {hist.sum().item()}, "f"hist = {hist.tolist()}")
-            ml_text_talagrand += f"Lead t={lead_hour}:\n\ttotal cases = {hist.sum().item()},\n\thist = {hist.tolist()}\n"
+            for lead_hour in tqdm(lead_hours_to_plot, desc="Computing Talagrand Histograms"):
+                hist = rank_histogram_for_lead(
+                    mu_all=mu_all,
+                    sigma_all=sigma_all,
+                    targets_all=targets_all,
+                    device=device,
+                    n_samples=20,
+                )
 
-            for lead_hour, hist in histograms.items():
-                hist_np = hist.numpy().astype(float)
-                hist_np /= hist_np.sum()
+                histograms[lead_hour] = hist
 
-                ranks = np.arange(len(hist_np))  # 0..20
+                # print(f"Lead t={lead_hour}: total cases = {hist.sum().item()}, "f"hist = {hist.tolist()}")
+                ml_text_talagrand += f"Lead t={lead_hour}:\n\ttotal cases = {hist.sum().item()},\n\thist = {hist.tolist()}\n"
 
-                plt.figure()
-                plt.bar(ranks, hist_np, width=0.8, edgecolor='black')
-                plt.xlabel("Rank")
-                plt.ylabel("Relative frequency")
-                plt.title(f"Rank histogram - lead t={lead_hour}", fontsize=14)
-                plt.xticks(ranks)
-                plt.grid(axis='y', alpha=0.3)
-                
-                # expected uniform line
-                expected_freq = 1.0 / len(hist_np)
-                plt.axhline(y=expected_freq, color='red', linestyle='--', linewidth=2, label=f'Expected (uniform): {expected_freq:.4f}')
-                plt.legend()
-                
-                os.makedirs("results", exist_ok=True)
-                plot_filename = os.path.join("results", f"talagrand_diagram_lead{lead_hour}.png")
-                plt.savefig(plot_filename)
-                mlflow.log_figure(plt.gcf(), f"talagrand_diagram_lead{lead_hour}.png")
-                plt.close()
+                for lead_hour, hist in histograms.items():
+                    hist_np = hist.numpy().astype(float)
+                    hist_np /= hist_np.sum()
+
+                    ranks = np.arange(len(hist_np))  # 0..20
+
+                    plt.figure()
+                    plt.bar(ranks, hist_np, width=0.8, edgecolor='black')
+                    plt.xlabel("Rank")
+                    plt.ylabel("Relative frequency")
+                    plt.title(f"Rank histogram - lead t={lead_hour}", fontsize=14)
+                    plt.xticks(ranks)
+                    plt.grid(axis='y', alpha=0.3)
+                    
+                    # expected uniform line
+                    expected_freq = 1.0 / len(hist_np)
+                    plt.axhline(y=expected_freq, color='red', linestyle='--', linewidth=2, label=f'Expected (uniform): {expected_freq:.4f}')
+                    plt.legend()
+                    
+                    os.makedirs("results", exist_ok=True)
+                    plot_filename = os.path.join("results", f"talagrand_diagram_lead{lead_hour}.png")
+                    plt.savefig(plot_filename)
+                    mlflow.log_figure(plt.gcf(), f"talagrand_diagram_lead{lead_hour}.png")
+                    plt.close()
+            
+            mlflow.log_text(ml_text_talagrand, "talagrand_histograms.txt")
+            #print(ml_text_talagrand)
         
-        mlflow.log_text(ml_text_talagrand, "talagrand_histograms.txt")
-        #print(ml_text_talagrand)
+        return best_val_loss
+    
+    except Exception as e:
+        # Re-raise Optuna pruning exceptions and OOM errors
+        import optuna
+        if isinstance(e, optuna.TrialPruned) or "out of memory" in str(e).lower():
+            raise
+        print(f"Training failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+        return float('inf')
+
+
+@hydra.main(version_base="1.1", config_path="./configs", config_name="default_training_conf")
+def app(cfg: DictConfig):
+    train_with_config(cfg, trial=None)
 
 
 if __name__ == '__main__':

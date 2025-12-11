@@ -16,7 +16,7 @@ from omegaconf import OmegaConf
 from pathlib import Path
 
 # Import the training function
-from spatiotemporal_postprocessing.train import train_with_config, set_seed
+from spatiotemporal_postprocessing.train_tune import train_with_config, set_seed
 
 
 def objective(trial, base_config_path, model_name=None):

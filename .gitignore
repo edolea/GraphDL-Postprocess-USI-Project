@@ -2,6 +2,16 @@ help.sh
 results/
 tuning/
 
+# utils
+spatiotemporal_postprocessing/utils/__pycache__/
+spatiotemporal_postprocessing/utils/model0
+spatiotemporal_postprocessing/utils/default
+spatiotemporal_postprocessing/utils/stgnn1
+spatiotemporal_postprocessing/utils/stgnn2
+spatiotemporal_postprocessing/utils/wavenet
+spatiotemporal_postprocessing/utils/bidirectional_rnn
+spatiotemporal_postprocessing/utils/mlp
+
 # Mlflow
 mlruns
 spatiotemporal_postprocessing/mlruns

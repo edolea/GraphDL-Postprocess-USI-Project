@@ -102,10 +102,10 @@ def app(cfg: DictConfig):
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
 
-                if batch_idx == 0:
+                # if batch_idx == 0:
                     # print("x_batch", x_batch.shape)
                     # print("max alloc MB", torch.cuda.max_memory_allocated() / 1e6)
-                    torch.cuda.reset_peak_memory_stats()
+                    # torch.cuda.reset_peak_memory_stats()
 
                 
                 optimizer.zero_grad()  

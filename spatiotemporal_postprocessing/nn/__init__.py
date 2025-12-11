@@ -1,6 +1,6 @@
 import sys
 
-from .models import BiDirectionalSTGNN, MLP, WaveNet, Model0TCN, EnhancedBiDirectionalSTGNN, AttentionTCN_GNN
+from .models import BiDirectionalSTGNN, MLP, WaveNet, Model0TCN, EnhancedBiDirectionalSTGNN, EnhancedTCN_GNN
 from .prototypes import TCN_GNN
 
 def get_model(model_type, **kwargs):

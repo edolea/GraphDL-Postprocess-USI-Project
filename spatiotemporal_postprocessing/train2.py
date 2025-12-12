@@ -158,7 +158,7 @@ def app(cfg: DictConfig):
             mlflow.log_metric("val_loss_original_range", avg_val_loss_or, step=epoch)
             
             # Optional plotting
-            if epoch % 10 == 0:
+            if False: #epoch % 10 == 0:
                 with torch.no_grad():
                     x_val_batch, y_val_batch = next(iter(val_dataloader))  
                     x_val_batch = x_val_batch.to(device)

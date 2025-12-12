@@ -70,7 +70,18 @@ class XarrayDataset(Dataset):
     
     
     
-def get_graph(lat, lon, knn=10, threshold=None):
+def get_graph(lat,
+              lon,
+              knn=10,
+              threshold=None,
+              theta=None,
+              theta_strategy="std",
+              theta_scale=1.0,
+              max_distance_km=None,
+              mutual=False,
+              orography=None,
+              orography_scale=None,
+              orography_alpha=1.0):
     
     def haversine(lat1, lon1, lat2, lon2, radius=6371):
         import math
@@ -99,19 +110,45 @@ def get_graph(lat, lon, knn=10, threshold=None):
             dist[i,j] = d
             dist[j,i] = d
             
-    def gaussian_kernel(x, theta=None):
-        if theta is None:
-            theta = x.std()
-        weights = np.exp(-np.square(x / theta))
+    def gaussian_kernel(x, theta_val):
+        weights = np.exp(-np.square(x / theta_val))
         return weights
     
-    adj = gaussian_kernel(dist)
-    
+    # default behaviour unless additional graph keywargs
+    if theta is None:
+        if theta_strategy == "nn_median":
+            masked = dist + np.eye(n) * 1e9
+            nn = np.partition(masked, 1, axis=1)[:, 1]
+            theta = np.median(nn)
+        else:
+            theta = dist.std()
+        theta = theta * theta_scale
+
+    adj = gaussian_kernel(dist, theta)
+
+    if orography is not None:
+        oro = np.asarray(orography)
+        if oro.ndim != 1 or oro.shape[0] != n:
+            raise ValueError("orography must be a 1D array with length equal to number of stations")
+        oro_diff = np.abs(oro[:, None] - oro[None, :])
+        scale = orography_scale
+        if scale is None:
+            scale = oro_diff.std()
+        scale = max(scale, 1e-6)
+        oro_penalty = np.exp(-orography_alpha * np.square(oro_diff / scale))
+        adj = adj * oro_penalty
+
+    if max_distance_km is not None:
+        adj[dist > max_distance_km] = 0
+
     adj = top_k(adj,knn, include_self=True,keep_values=True)
     
     if threshold is not None:
-            adj[adj < threshold] = 0
-    
+        adj[adj < threshold] = 0
+
+    if mutual:
+        adj = np.minimum(adj, adj.T)
+
     return adj
 
 class PostprocessDatamodule():
@@ -203,6 +240,21 @@ def get_datamodule(ds: xr.Dataset,
     if return_graph:
         lat = ds.latitude.data
         lon = ds.longitude.data
+        graph_kwargs = graph_kwargs or {}
+        graph_kwargs = dict(graph_kwargs)  # avoid mutating caller (hydra reuse)
+        
+        # Handle orography variable
+        oro_var = graph_kwargs.pop("orography_var", None)
+        if oro_var:
+            if oro_var not in ds:
+                raise ValueError(f"Orography variable '{oro_var}' not found in dataset.")
+            oro_da = ds[oro_var]
+            # Collapse static dims to get per-station values
+            for dim in ("forecast_reference_time", "lead_time"):
+                if dim in oro_da.dims:
+                    oro_da = oro_da.isel({dim: 0})
+            graph_kwargs["orography"] = oro_da.data
+
         adj_matrix = get_graph(lat=lat, lon=lon, **graph_kwargs)
         return PostprocessDatamodule(train_dataset=XarrayDataset(input_data=train_input_data, target_data=train_target_data),
                                      val_dataset=XarrayDataset(input_data=val_input_data, target_data=val_target_data),

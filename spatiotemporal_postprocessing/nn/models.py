@@ -398,7 +398,6 @@ class EnhancedBiDirectionalSTGNN(nn.Module):
 STGNN2: EnhancedTCN_GNN
 """
 
-
 class EnhancedTCN_GNN(nn.Module):
     def __init__(self, num_layers, input_size, output_dist, hidden_channels, 
                  n_stations, kernel_size=3, dropout_p=0.2, causal_conv=True, 
@@ -410,11 +409,16 @@ class EnhancedTCN_GNN(nn.Module):
             
         self.hidden_dim = hidden_channels[0]
         
+        # --- Insight 1: Embeddings ---
+        # Station Embedding (Spatial Identity)
         self.station_emb = NodeEmbedding(n_stations, self.hidden_dim)
+        # Horizon Embedding (Temporal Identity - Critical for error growth modeling)
         self.horizon_emb = nn.Embedding(max_lead_time + 1, self.hidden_dim)
         
+        # Initial Projection
         self.encoder = nn.Linear(input_size, self.hidden_dim)
 
+        # --- Backbone: Interleaved TCN + Local GNN ---
         self.tcn_layers = nn.ModuleList()
         self.gat_layers = nn.ModuleList()
         self.norm_layers = nn.ModuleList()
@@ -424,12 +428,15 @@ class EnhancedTCN_GNN(nn.Module):
             in_size = hidden_channels[0] if l == 0 else hidden_channels[l-1]
             out_size = hidden_channels[l]
             
+            # TCN: Extract temporal features per station
             self.tcn_layers.append(
                 TCNLayer(in_channels=in_size, out_channels=out_size, 
                          kernel_size=kernel_size, dilation=dilation, 
                          dropout_p=dropout_p, causal_conv=causal_conv)
             )
             
+            # GATv2: Process LOCAL physical neighbors (sparse graph)
+            # We keep this lightweight compared to the previous DualBlock
             self.gat_layers.append(
                 GATv2Conv(out_size, out_size, heads=gat_heads, 
                           concat=False, dropout=dropout_p, add_self_loops=True)
@@ -437,6 +444,7 @@ class EnhancedTCN_GNN(nn.Module):
             
             self.norm_layers.append(nn.LayerNorm(out_size))
             
+        # --- Insight 2: Spatial Attention Refinement ---
         self.global_spatial_attn = nn.MultiheadAttention(
             embed_dim=self.hidden_dim, 
             num_heads=4, 
@@ -445,28 +453,35 @@ class EnhancedTCN_GNN(nn.Module):
         )
         self.attn_norm = nn.LayerNorm(self.hidden_dim)
 
+        # --- Insight 3: Gated Input Injection ---
         self.raw_skip_proj = nn.Linear(input_size, self.hidden_dim)
         self.gate_generator = nn.Linear(self.hidden_dim, self.hidden_dim)
 
+        # Output
         self.output_distr = dist_to_layer[output_dist](input_size=self.hidden_dim)
 
     def forward(self, x, edge_index):
+        # x: [B, T, N, F]
+        B, T, N, F = x.shape
         
-        B, T, N, F = x.shape # x: [B, T, N, F]
-        
+        # 1. Embeddings & Encoding
         h = self.encoder(x) # [B, T, N, H]
         
+        # Add Station Embedding
         h = h + self.station_emb() # Broadcasting over B and T
         
         # Add Horizon Embedding
+        # Create indices [0, 1, ..., T-1] repeated for batch and stations
         horizon_ids = torch.arange(T, device=x.device)
         # We need to broadcast this to [B, T, N, H]
         t_emb = self.horizon_emb(horizon_ids).unsqueeze(0).unsqueeze(2) # [1, T, 1, H]
         h = h + t_emb
 
-        h_tcn = rearrange(h, 'b t n c -> (b n) c t') # [(B N), H, T]
+        # 2. Backbone Processing
+        # Prepare for TCN: [(B N), H, T]
+        h_tcn = rearrange(h, 'b t n c -> (b n) c t')
         
-        # Prepare Batch Edge Index for GAT
+        # Prepare Batch Edge Index for GAT (Pre-computed once)
         src, dst = edge_index
         offsets = torch.arange(B * T, device=x.device) * N
         src_batch = (src.unsqueeze(0) + offsets.unsqueeze(1)).flatten()
@@ -485,28 +500,38 @@ class EnhancedTCN_GNN(nn.Module):
             h_spatial = rearrange(h_tcn, '(b n) c t -> (b t) n c', b=B, n=N)
             h_spatial_flat = h_spatial.reshape(-1, self.hidden_dim) # [(B T N), H]
             
+            # Physical Graph Step (Local Diffusion)
             h_gat = gat(h_spatial_flat, batch_edge_index)
             
+            # Residual + Norm
             h_gat = h_gat.view(B*T, N, -1)
-            h_spatial = norm(h_spatial + h_gat) 
+            h_spatial = norm(h_spatial + h_gat) # Residual connection crucial here
             
+            # Back to TCN shape
             h_tcn = rearrange(h_spatial, '(b t) n c -> (b n) c t', b=B, t=T)
 
             h_final_tcn = h_tcn.clone()
             
             skips.append(skip)
 
+        # Sum WaveNet skips
         h_deep = torch.stack(skips, dim=-1).sum(dim=-1) + h_final_tcn   # [(B N), H, T]
         h_deep = rearrange(h_deep, '(b n) h t -> (b t) n h', b=B, n=N)  # [(B T), N, H]
 
-
+        # 3. Global Spatial Refinement (Transformer)
+        # Allows distant stations to correct each other dynamically
+        # Query=Key=Value=h_deep
         attn_out, _ = self.global_spatial_attn(h_deep, h_deep, h_deep)
         h_refined = self.attn_norm(h_deep + attn_out)
 
+        # 4. Gated Input Injection
+        # Reshape to [B, T, N, H]
         h_refined = rearrange(h_refined, '(b t) n h -> b t n h', b=B, t=T)
-
+        
+        # Compute Gate
         gate = torch.sigmoid(self.gate_generator(h_refined))
         
+        # Skip projection of raw input
         raw_proj = self.raw_skip_proj(x)
         
         # Final fusion: Blend deep features with raw input features

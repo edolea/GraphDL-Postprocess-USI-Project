@@ -8,9 +8,7 @@ set -e  # Exit on any error
 echo "Starting tune-and-run experiments..."
 
 # Array of config names to tune and run
-configs=("model0" "bidirectional_rnn" "stgnn1" "stgnn2" "wavenet" "mlp")
-configs=("bidirectional_rnn" "stgnn1" "stgnn2" "wavenet" "mlp")
-configs=("stgnn1" "stgnn2" "wavenet" "mlp")
+configs=("model0" "bidirectional_rnn" "stgnn1" "stgnn2" ""default_training_config)
 
 # Array of seeds for final training runs
 seeds=(42 123 456 789 2024)
@@ -39,7 +37,7 @@ for config in "${configs[@]}"; do
         echo "→ STEP 1: Tuning hyperparameters for $config..."
         echo "  (Running $n_trials trials)"
         
-        python tune_simple.py \
+        python tune.py \
             --n-trials=$n_trials \
             --base-config="configs/${config}.yaml" \
             --output-name="$tuned_config" \
@@ -53,42 +51,12 @@ for config in "${configs[@]}"; do
             exit 1
         fi
     fi
-    
-    # Step 2: Run training with tuned config on multiple seeds
-    echo ""
-    echo "→ STEP 2: Running training with tuned config on ${#seeds[@]} seeds..."
-    
-    for seed in "${seeds[@]}"; do
-        echo ""
-        echo "  Training ${tuned_config} (seed=$seed)..."
-        
-        python train.py \
-            --config-name="$tuned_config" \
-            logging.run_name="${tuned_config}_seed${seed}" \
-            seed="$seed"
-        
-        if [ $? -eq 0 ]; then
-            echo "  ✓ Completed: ${tuned_config} (seed=$seed)"
-        else
-            echo "  ✗ Failed: ${tuned_config} (seed=$seed)"
-            exit 1
-        fi
-    done
-    
-    echo ""
-    echo "✓ All runs completed for $config"
-    echo "=========================================="
 done
 
 echo ""
 echo "=========================================="
-echo "SUCCESS! All experiments completed!"
+echo "tuning completed"
 echo "=========================================="
-echo ""
-echo "Summary:"
-echo "  - Tuned $total_configs models"
-echo "  - Ran ${#seeds[@]} training runs per model"
-echo "  - Total training runs: $((total_configs * ${#seeds[@]}))"
 echo ""
 echo "Tuned configs saved in: configs/"
 echo "Tuning reports saved in: tuning/"

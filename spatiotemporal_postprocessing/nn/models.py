@@ -177,7 +177,28 @@ Model0
 
 class Model0TCN(nn.Module):
     """
-    TCN-only baseline model (Model0).
+    Temporal Convolutional Network (TCN) baseline model for weather postprocessing.
+    
+    This non-graph baseline processes each weather station independently using stacked 
+    dilated temporal convolutions to capture multi-scale temporal patterns. It serves 
+    as a control to quantify the performance gap when spatial dependencies between 
+    stations are completely ignored.
+    
+    Architecture:
+        - Input encoding: Linear projection to hidden dimension
+        - Stacked TCN layers with exponentially growing dilation rates (2^l for layer l)
+        - Each layer produces both a residual output and a skip connection
+        - Final output combines all temporal scales: sum(skips) + final_layer_output
+        - Non-causal convolutions: can look both forward and backward in forecast window
+    
+    Args:
+        input_size (int): Number of input features per timestep
+        hidden_channels (int): Hidden dimension size
+        n_stations (int): Number of weather stations
+        output_dist (str): Output distribution type (e.g., 'LogNormal')
+        num_layers (int): Number of TCN layers
+        kernel_size (int): Temporal kernel size for convolutions
+        dropout_p (float): Dropout probability
     """
 
     def __init__(self, input_size, hidden_channels, n_stations, output_dist: str, num_layers, kernel_size, dropout_p, **kwargs):
@@ -230,7 +251,47 @@ STGNN1
 
 class EnhancedLayeredGraphRNN(nn.Module):
     """
-    add explanation
+    Enhanced Layered Graph RNN for spatiotemporal weather postprocessing.
+    
+    This class implements a single directional (forward or backward) spatiotemporal 
+    processing stream that combines Graph Attention Networks (GATv2) for spatial 
+    aggregation with GRU cells for temporal modeling.
+
+    Architecture Flow (per timestep t):
+        For each layer l in n_layers:
+            1. Spatial Aggregation: GATv2 aggregates information from neighbors
+            2. Temporal Gating: GRU updates hidden state using spatial features
+            3. Normalization: LayerNorm for stable training
+            4. Feed to Next Layer: Output becomes input to next spatial layer    
+    
+    Improvements wrt previous version:
+        1. Layer-by-Layer Processing: True deep learning where each layer takes the 
+           previous layer's output as input, enabling hierarchical spatial representations
+           
+           h^(l)_t = GRU(GAT^(l)(h^(l-1)_t, E), h^(l)_{t-1})
+           
+           where for l=0, h^(-1)_t denotes the encoded input features.
+           
+        2. GATv2 Attention Mechanism: Learns to weight neighbors dynamically using 
+           multi-head attention, automatically focusing on meteorologically relevant 
+           stations (e.g., upwind nodes during advection events):
+           
+           α_ij = softmax_j(a^T · LeakyReLU(W[h_i | h_j]))
+           
+        3. GRU Temporal Gates: Learnable gating mechanism for robust gradient flow:
+           
+           h_t = (1-z_t) ⊙ h_{t-1} + z_t ⊙ h̃_t
+           
+           The update gate z_t balances old vs. new memory, while the reset gate r_t 
+           allows dropping irrelevant historical context.
+    
+    Args:
+        input_size (int): Dimension of input features
+        hidden_size (int): Hidden state dimension
+        n_layers (int): Number of spatial layers (depth)
+        dropout_p (float): Dropout probability
+        mode (Literal['forwards', 'backwards']): Temporal processing direction
+        num_heads (int): Number of attention heads in GATv2
     """
     def __init__(self, input_size, hidden_size, n_layers=2, dropout_p=0.1, 
                  mode: Literal['forwards', 'backwards'] = 'forwards', num_heads=2, **kwargs):
@@ -262,7 +323,7 @@ class EnhancedLayeredGraphRNN(nn.Module):
     def forward(self, x, edge_index):
         batch_size, win_size, num_nodes, num_feats = x.size()
         
-        # Initialize states
+        # ini states
         state = torch.zeros(batch_size, num_nodes, self.state_size, device=x.device)
         
         # Efficient Batch Graph Construction
@@ -290,14 +351,14 @@ class EnhancedLayeredGraphRNN(nn.Module):
             for l in range(self.n_layers):
                 h_prev = prev_states[:, l, :] # [B*N, H]
                 
-                # 1. Spatial Aggregation (GAT)
+                # Spatial Aggregation (GAT)
                 x_spatial = self.gat_layers[l](current_input, batch_edge_index)
                 x_spatial = self.dropout(x_spatial)
                 
-                # 2. Temporal Gating (GRU)
+                # Temporal Gating (GRU)
                 h_new = self.gru_cells[l](x_spatial, h_prev)
                 
-                # Norm & Skip
+                # Norm e Skip
                 h_new = self.layer_norms[l](h_new)
                 
                 new_layer_states.append(h_new)
@@ -317,7 +378,44 @@ class EnhancedLayeredGraphRNN(nn.Module):
 
 class EnhancedBiDirectionalSTGNN(nn.Module):
     """
-    Refactored STGNN1 container.
+    Enhanced Bidirectional Spatiotemporal Graph Neural Network (STGNN1).
+    
+    This model processes weather forecasts by combining forward and backward temporal 
+    processing with spatial graph attention, enabling the capture of both past and future 
+    temporal context along with spatial dependencies between weather stations.
+    
+    Architecture Overview:
+        1. Input Encoding: Linear projection + LayerNorm + SiLU activation
+        2. Station Embeddings: Learnable embeddings added to capture station-specific biases
+        3. Bidirectional Processing:
+           - Forward stream: Processes temporal sequence from t=0 to t=T
+           - Backward stream: Processes temporal sequence from t=T to t=0
+        4. Skip Connection: Projects raw input to match bidirectional state dimension
+        5. Hierarchical Readout: 3-layer MLP with normalization to combine information:
+           - Layer 1: 2H·L → 2H (combine bidirectional multi-layer states)
+           - Layer 2: 2H → H (compress to hidden dimension)
+           - Layer 3: H → H (final refinement)
+        6. Distribution Output: Maps to probabilistic distribution parameters (μ, σ)
+    
+    Info Flow:
+        x → Encode → +StationEmb → [ForwardRNN, BackwardRNN]
+          ↓                              ↓
+        Skip ────────────────────────→ Concat → Readout → Output Distribution
+    
+    Key improvements over BiDirectionalSTGNN:
+        1. Each EnhancedLayeredGraphRNN uses GATv2 instead of simple message passing
+        2. GRU cells replace additive residuals for better gradient flow
+        3. Hierarchical 3-layer readout (vs simple 2-layer) for better feature combination
+        4. Enhanced normalization with LayerNorm throughout the architecture
+    
+    Args:
+        input_size (int): Number of input features per timestep
+        hidden_size (int): Hidden state dimension  
+        n_stations (int): Number of weather stations
+        output_dist (str): Output distribution type (e.g., 'LogNormal')
+        n_layers (int): Number of spatial layers in each directional stream
+        dropout_p (float): Dropout probability
+        num_heads (int): Number of attention heads for GATv2
     """
     def __init__(self, input_size, hidden_size, n_stations, output_dist: str, 
                  n_layers=2, dropout_p=0.1, num_heads=4, **kwargs):
@@ -387,6 +485,65 @@ STGNN2
 """
 
 class EnhancedTCN_GNN(nn.Module):
+    """
+    Enhanced Temporal-Convolutional Graph Neural Network (STGNN2).
+    
+    This model combines temporal convolutions (TCN) for multi-scale temporal feature 
+    extraction with graph neural networks (GNN) for spatial aggregation, enhanced with 
+    global attention and adaptive gating mechanisms.
+
+    Architecture Flow:
+        1. Encoding: Linear projection + station embeddings + horizon embeddings
+        2. TCN-GNN Backbone (num_layers iterations):
+           a. TCN Layer: Dilated causal convolutions with dilation = 2^l
+           b. Spatial Refinement: GATv2 processes all timesteps simultaneously  
+           c. Residual: Add GATv2 output to create refined spatial features
+           d. Store Skip: Save for multi-scale combination
+        3. Multi-Scale Combination: sum(skips) + final_layer
+        4. Global Attention: Self-attention across all stations
+        5. Adaptive Gating: Blend refined features with raw input
+        6. Output: Probabilistic distribution parameters (μ, σ)    
+    
+    Key improvements over TCN_GNN prototype:
+        1. Direction-Aware Spatial Aggregation: GATv2Conv with multi-head attention 
+           learns to weight neighbors based on meteorological relevance. Unlike STGNN1's 
+           per-timestep processing, GATv2 here refines the entire temporal sequence after 
+           TCN processing, operating on all timesteps simultaneously.
+           
+        2. Global Spatial Attention: Multi-head self-attention layer (4 heads) allows 
+           distant stations to exchange information directly:
+           
+           H_global = MultiHeadAttn(H_deep, H_deep, H_deep)
+           
+           This captures large-scale patterns like pressure gradients across Switzerland 
+           without requiring multiple message-passing hops.
+           
+        3. Smart Ensemble Correction via GRU-Inspired Gating: Blends deep features with 
+           raw predictions using learned gates:
+           
+           h_final = g ⊙ h_refined + (1-g) ⊙ h_raw
+           where g = σ(W_g · h_refined)
+           
+           Unlike STGNN1's temporal GRU gates, this operates on feature space rather 
+           than time, deciding how much to trust deep processing vs. raw predictions. 
+           This prevents over-correction when ensemble forecasts are already well-calibrated.
+           
+        4. Forecast Horizon Embeddings: Learnable embeddings e_τ ∈ ℝ^H for each lead 
+           time τ ∈ {1,...,96}, providing direct information about forecast horizon so 
+           the model can learn how uncertainty should grow with time.
+    
+    Args:
+        num_layers (int): Number of TCN-GNN layers
+        input_size (int): Number of input features
+        output_dist (str): Output distribution type (e.g., 'LogNormal')
+        hidden_channels (Union[int, List[int]]): Hidden dimensions (per layer or constant)
+        n_stations (int): Number of weather stations
+        kernel_size (int): Temporal kernel size for TCN
+        dropout_p (float): Dropout probability
+        causal_conv (bool): Whether to use causal convolutions (typically True)
+        gat_heads (int): Number of attention heads in GATv2
+        max_lead_time (int): Maximum forecast lead time (for horizon embeddings)
+    """
     def __init__(self, num_layers, input_size, output_dist, hidden_channels, 
                  n_stations, kernel_size=3, dropout_p=0.2, causal_conv=True, 
                  gat_heads=2, max_lead_time=96, **kwargs):
@@ -397,13 +554,12 @@ class EnhancedTCN_GNN(nn.Module):
             
         self.hidden_dim = hidden_channels[0]
         
-        # --- Insight 1: Embeddings ---
+        # horizon Embeddings
         self.station_emb = NodeEmbedding(n_stations, self.hidden_dim)
-        self.horizon_emb = nn.Embedding(max_lead_time + 1, self.hidden_dim)
+        self.horizon_emb = nn.Embedding(max_lead_time + 1, self.hidden_dim) # 97
         
         self.encoder = nn.Linear(input_size, self.hidden_dim)
 
-        # --- Backbone: Interleaved TCN + Local GNN ---
         self.tcn_layers = nn.ModuleList()
         self.gat_layers = nn.ModuleList()
         self.norm_layers = nn.ModuleList()
@@ -479,8 +635,8 @@ class EnhancedTCN_GNN(nn.Module):
             
             skips.append(skip)
 
-        h_deep = torch.stack(skips, dim=-1).sum(dim=-1) + h_final_tcn   # [(B N), H, T]
-        h_deep = rearrange(h_deep, '(b n) h t -> (b t) n h', b=B, n=N)  # [(B T), N, H]
+        h_deep = torch.stack(skips, dim=-1).sum(dim=-1) + h_final_tcn
+        h_deep = rearrange(h_deep, '(b n) h t -> (b t) n h', b=B, n=N)
 
         attn_out, _ = self.global_spatial_attn(h_deep, h_deep, h_deep)
         h_refined = self.attn_norm(h_deep + attn_out)

@@ -114,7 +114,7 @@ def get_graph(lat,
         weights = np.exp(-np.square(x / theta_val))
         return weights
     
-    # default behaviour unless additional graph keywargs
+    # default behaviour maintained (unless additional graph keywargs)
     if theta is None:
         if theta_strategy == "nn_median":
             masked = dist + np.eye(n) * 1e9
@@ -241,15 +241,15 @@ def get_datamodule(ds: xr.Dataset,
         lat = ds.latitude.data
         lon = ds.longitude.data
         graph_kwargs = graph_kwargs or {}
-        graph_kwargs = dict(graph_kwargs)  # avoid mutating caller (hydra reuse)
+        graph_kwargs = dict(graph_kwargs)
         
-        # Handle orography variable
+        # orography variable
         oro_var = graph_kwargs.pop("orography_var", None)
         if oro_var:
             if oro_var not in ds:
                 raise ValueError(f"Orography variable '{oro_var}' not found in dataset.")
             oro_da = ds[oro_var]
-            # Collapse static dims to get per-station values
+            # collapse of static dims to get per-station values
             for dim in ("forecast_reference_time", "lead_time"):
                 if dim in oro_da.dims:
                     oro_da = oro_da.isel({dim: 0})

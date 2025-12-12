@@ -31,8 +31,7 @@ def collect_model_outputs(model,
     """
     Collect mu, sigma, and targets over an entire dataloader.
 
-    Returns
-    -------
+    Returns:
     mu_all, sigma_all, targets_all : tensors of shape [N, L, S]
         N = total number of forecast reference times over all batches.
     """
@@ -45,7 +44,6 @@ def collect_model_outputs(model,
         x_batch = x_batch.to(device)
         y_batch = y_batch.to(device)
 
-        # Assuming model returns a distribution with .loc and .scale
         if edge_index is not None:
             pred_dist = model(x_batch, edge_index=edge_index)
         else:
@@ -60,7 +58,7 @@ def collect_model_outputs(model,
 
     mu_all = torch.cat(all_mu, dim=0)          # [N, L, S]
     sigma_all = torch.cat(all_sigma, dim=0)    # [N, L, S]
-    targets_all = torch.cat(all_targets, dim=0) # [N, L, S]
+    targets_all = torch.cat(all_targets, dim=0)# [N, L, S]
 
     return mu_all, sigma_all, targets_all
 
@@ -76,8 +74,7 @@ def rank_histogram_for_lead(mu_all,
     """
     Compute Talagrand / rank histogram for a single lead time.
 
-    Parameters
-    ----------
+    Parameters:
     mu_all, sigma_all, targets_all : torch.Tensor
         Shape [N, L, S].
     lead_idx : int
@@ -88,8 +85,7 @@ def rank_histogram_for_lead(mu_all,
     device : str or torch.device
         Device on which to perform sampling.
 
-    Returns
-    -------
+    Returns:
     hist : torch.Tensor
         Shape [n_samples + 1], counts of ranks 0..n_samples.
     """
@@ -103,9 +99,9 @@ def rank_histogram_for_lead(mu_all,
     dist = torch.distributions.LogNormal(mu_t, sigma_t)
 
     # Sample shape: [n_samples, N, S]
-    samples = dist.rsample((n_samples,))  # rsample if you want gradients, sample otherwise
+    samples = dist.rsample((n_samples,))
 
-    # Flatten across (N, S): treat each (forecast_time, station) as an independent case
+
     y_flat = y_t.reshape(-1)                    # [M]
     samples_flat = samples.reshape(n_samples, -1)  # [n_samples, M]
 
@@ -115,7 +111,6 @@ def rank_histogram_for_lead(mu_all,
     samples_flat = samples_flat[:, valid_flat]   # [n_samples, M_valid]
 
     # Compute ranks:
-    # For each case j, rank_j = number of samples < observation
     # ranks in {0, 1, ..., n_samples}
     ranks = (samples_flat < y_flat.unsqueeze(0)).sum(dim=0)  # [M_valid]
 
@@ -137,8 +132,7 @@ def evaluate_crps_weighted_over_batches(model,
     """
     Evaluates CRPS (log-normal) on a dataset.
 
-    Returns
-    -------
+    Returns:
     crps_mean : float
         Mean CRPS over all batches, all leads, all stations (original range).
     crps_at_leads : dict
@@ -149,16 +143,15 @@ def evaluate_crps_weighted_over_batches(model,
     total_crps_sum = 0.0
     total_valid_count = 0
 
-    # For per-lead CRPS
+    # per-lead CRPS
     lead_times = list(important_leads)
     lead_crps_sum = {t: 0.0 for t in lead_times}
     lead_crps_count = {t: 0 for t in lead_times}
 
     for x_batch, y_batch in tqdm(dataloader, desc="Evaluating CRPS"):
         x_batch = x_batch.to(device)
-        y_batch = y_batch.to(device)          # shape [B, L, S]
+        y_batch = y_batch.to(device)          # [B, L, S]
 
-        # Forward pass
         if edge_index is not None:
             pred_dist = model(x_batch, edge_index=edge_index)
         else:
@@ -184,12 +177,10 @@ def evaluate_crps_weighted_over_batches(model,
             if lead_idx >= y_den.size(1):
                 continue  # safety check, in case L < max requested lead
 
-            # Slice this lead: shapes [B, S]
             y_t = y_den[:, lead_idx, :]
             mu_t = pred_den.loc[:, lead_idx, :]
             sigma_t = pred_den.scale[:, lead_idx, :]
 
-            # --- Same logic as MaskedCRPSLogNormal, but on this slice only ---
             mask = ~torch.isnan(y_t)
             lead_count = mask.sum().item()
             if lead_count == 0:
@@ -200,7 +191,7 @@ def evaluate_crps_weighted_over_batches(model,
             sigma_mask = sigma_t[mask]
 
             eps = 1e-5
-            y_mask = y_mask + eps  # avoid 0
+            y_mask = y_mask + eps
 
             normal = torch.distributions.Normal(
                 torch.zeros_like(mu_mask),
@@ -210,7 +201,7 @@ def evaluate_crps_weighted_over_batches(model,
             omega = (torch.log(y_mask) - mu_mask) / sigma_mask
 
             ex_input = mu_mask + (sigma_mask ** 2) / 2
-            ex_input = torch.clamp(ex_input, max=15)  # same stability trick
+            ex_input = torch.clamp(ex_input, max=15)  # same as in original loss.py
             ex = 2 * torch.exp(ex_input)
 
             crps_vals = (
@@ -248,12 +239,12 @@ def evaluate_crps(
 ):
     model.eval()
 
-    # Store all valid samples for full unbiased averaging
+    # all samples for full unbiased averaging
     all_y = []
     all_mu = []
     all_sigma = []
 
-    # For per-lead reporting
+    # per-lead reporting
     lead_stats = {t: {"y": [], "mu": [], "sigma": []} for t in important_leads}
 
     for x_batch, y_batch in tqdm(dataloader, desc="Evaluating CRPS"):
@@ -391,7 +382,6 @@ def evaluaate_crps_with_nwp_baseline(model,
                                     target_denormalizer,     # dm.test_dataset.target_denormalizer
                                     nwp_mean_idx,            # index in last dim of x_denorm for ensemble mean
                                     nwp_std_idx,             # index in last dim of x_denorm for ensemble std
-                                    # lead_index_lookup,       # dict: {lead_hour: lead_index}
                                     available_leads=(1, 24, 48, 96),
                                     edge_index=None,
 ):
@@ -400,8 +390,7 @@ def evaluaate_crps_with_nwp_baseline(model,
       - the model (LogNormal output)
       - the NWP baseline (LogNormal fitted from ensemble mean/std)
 
-    Returns
-    -------
+    Returns:
     results : dict
         {
           "model": {
@@ -474,8 +463,6 @@ def evaluaate_crps_with_nwp_baseline(model,
 
         # ---- PER-LEAD METRICS ----
         for lead_hour in available_leads:
-            # Slice this lead: keep shape [B, 1, S] (+1 for last dim)
-            # TODO: SUPER MEGA DOUBLE CHECK lead index, DOVREBBE ESSERE 0,23,47,95?
             y_lead = y_den[:, lead_hour:lead_hour+1, ...] # l_h:l_h+1 to keep dim: [B, 1, S]
             #if lead_hour == 96:
              #   print("y_lead: ", y_lead[0,0,:])
@@ -518,7 +505,6 @@ def evaluaate_crps_with_nwp_baseline(model,
             )
 
 
-    # Finalize
     model_crps_overall, model_mae_overall = _finalize_metric_store(model_metrics)
     nwp_crps_overall,   nwp_mae_overall   = _finalize_metric_store(nwp_metrics)
 
@@ -558,7 +544,6 @@ def evaluaate_crps_with_nwp_baseline(model,
 
 
 def set_seed(seed=42):
-    """Set seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -591,11 +576,8 @@ def app(cfg: DictConfig):
     print(cfg)
     predictor_names = list(cfg.dataset.predictors)
     lead_hours_limit = int(cfg.dataset.hours_leadtime)
-    try:
-        nwp_mean_idx = predictor_names.index(f"{cfg.nwp_model}:wind_speed_ensavg")
-        nwp_std_idx = predictor_names.index(f"{cfg.nwp_model}:wind_speed_ensstd")
-    except ValueError as exc:
-        raise ValueError("NWP mean/std predictors not found in dataset configuration.") from exc
+    nwp_mean_idx = predictor_names.index(f"{cfg.nwp_model}:wind_speed_ensavg")
+    nwp_std_idx = predictor_names.index(f"{cfg.nwp_model}:wind_speed_ensstd")
 
     ds = xr.open_dataset(cfg.dataset.features_pth)
     ds_targets = xr.open_dataset(cfg.dataset.targets_pth)
@@ -630,13 +612,24 @@ def app(cfg: DictConfig):
     
     epochs = cfg.training.epochs
     criterion = get_loss(cfg.training.loss)
-    optimizer = getattr(torch.optim, cfg.training.optim.algo)(model.parameters(), **cfg.training.optim.kwargs)
+    
+    # Filter optimizer kwargs to only include valid parameters for the selected optimizer
+    import inspect
+    optimizer_class = getattr(torch.optim, cfg.training.optim.algo)
+    valid_params = inspect.signature(optimizer_class.__init__).parameters.keys()
+    filtered_kwargs = {k: v for k, v in cfg.training.optim.kwargs.items() if k in valid_params}
+    optimizer = optimizer_class(model.parameters(), **filtered_kwargs)
+            
     lr_scheduler = getattr(torch.optim.lr_scheduler, cfg.training.scheduler.algo)(optimizer, **cfg.training.scheduler.kwargs)
     gradient_clip_value = cfg.training.gradient_clip_value
     gradient_accumulation_steps = cfg.training.get('gradient_accumulation_steps', 1)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     model = model.to(device)
     edge_index = edge_index.to(device)
 
@@ -669,10 +662,10 @@ def app(cfg: DictConfig):
         best_val_loss = float('inf')
         epochs_without_improvement = 0
         patience = 15
-        val_loss_history = []  # Track recent validation losses for moving average
-        window_size = 10  # Compare average of last 5 epochs
-        min_delta = 1e-5  # Minimum improvement to be considered significant
-        best_model_state = None  # Store best model weights
+        val_loss_history = []    # for moving average
+        window_size = 10
+        min_delta = 1e-5         # minimum improvement to be considered significant
+        best_model_state = None  # store best model weights
         
         total_iter = 0
         loss_str = ""
@@ -686,16 +679,16 @@ def app(cfg: DictConfig):
                 y_batch = y_batch.to(device)
 
                 if CUDA_MEM and batch_idx == 1:
-                    torch.cuda.reset_peak_memory_stats()  # Reset BEFORE processing this batch
+                    torch.cuda.reset_peak_memory_stats()
                 
                 predictions = model(x_batch, edge_index=edge_index)  
 
                 loss = criterion(predictions, y_batch)
-                # Scale loss by accumulation steps to maintain consistent gradient magnitude
+                # Scale loss by accumulation steps
                 loss = loss / gradient_accumulation_steps
                 loss.backward()  
                 
-                # Only update weights every gradient_accumulation_steps
+                # update weights only at gradient_accumulation_steps
                 if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_dataloader):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_value)
                     optimizer.step()
@@ -718,7 +711,7 @@ def app(cfg: DictConfig):
             
             mlflow.log_metric("train_loss", avg_loss, step=epoch)
             
-            lr_scheduler.step(epoch=epoch) # TODO make this generic (not all lr_sched use the epoch as param)
+            lr_scheduler.step(epoch=epoch-1)
             for group, lr in enumerate(lr_scheduler.get_last_lr()):
                 mlflow.log_metric(f'lr_{group}', lr, step=epoch)
             
@@ -740,7 +733,6 @@ def app(cfg: DictConfig):
             avg_val_loss = val_loss / len(val_dataloader)
             avg_val_loss_or = val_loss_original_range / len(val_dataloader)
 
-            # Update progress bar with metrics
             epoch_pbar.set_postfix({
                 'train_loss': f'{avg_loss:.4f}',
                 'val_loss': f'{avg_val_loss:.4f}'
@@ -750,21 +742,18 @@ def app(cfg: DictConfig):
             mlflow.log_metric("val_loss", avg_val_loss, step=epoch)
             mlflow.log_metric("val_loss_original_range", avg_val_loss_or, step=epoch)
             
-            # Early stopping check with moving average
-            val_loss_history.append(avg_val_loss)
-            
-            # Save best model based on single epoch performance
+
+            val_loss_history.append(avg_val_loss)            
+            # best model
             if avg_val_loss < best_val_loss - min_delta:
                 best_val_loss = avg_val_loss
                 best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 epochs_without_improvement = 0
-                # print(f"  --- New best val_loss: {best_val_loss:.4f}")
             else:
                 epochs_without_improvement += 1
             
             # Check if we should stop based on moving average trend
             if len(val_loss_history) >= window_size + patience:
-                # Compare recent window average vs older window average
                 recent_avg = np.mean(val_loss_history[-window_size:])
                 older_avg = np.mean(val_loss_history[-(window_size + patience):-patience])
                 
@@ -777,7 +766,7 @@ def app(cfg: DictConfig):
                     loss_str += f"Early stopping at epoch {epoch + 1} (moving avg plateau)\n"
                     break
             
-            # Fallback: stop if no single-epoch improvement for too long
+            # fallback: stop if no single-epoch improvement for too long
             if epochs_without_improvement >= patience:
                 print("\n" + "="*50)
                 print(f"\nEarly stopping: no improvement for {patience} consecutive epochs")
@@ -803,7 +792,7 @@ def app(cfg: DictConfig):
 
         print("\n",   loss_str, "\n")
         
-        # Restore best model if we saved one
+        # restore best model
         if best_model_state is not None:
             model.load_state_dict({k: v.to(device) for k, v in best_model_state.items()})
             print(f"Restored best model from validation (val_loss={best_val_loss:.4f})")
@@ -884,7 +873,7 @@ def app(cfg: DictConfig):
                 plt.close()
         
         mlflow.log_text(ml_text_talagrand, "talagrand_histograms.txt")
-        #print(ml_text_talagrand)
+        # print(ml_text_talagrand)
 
 
 if __name__ == '__main__':

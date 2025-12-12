@@ -19,6 +19,8 @@ import numpy as np
 
 import shutil
 
+import optuna
+
 CUDA_MEM = False
 
 #TODO: improve talagrand by keeping all in gpu, not moving to cpu and then gpu
@@ -76,8 +78,7 @@ def rank_histogram_for_lead(mu_all,
     """
     Compute Talagrand / rank histogram for a single lead time.
 
-    Parameters
-    ----------
+    Parameters:
     mu_all, sigma_all, targets_all : torch.Tensor
         Shape [N, L, S].
     lead_idx : int
@@ -88,8 +89,7 @@ def rank_histogram_for_lead(mu_all,
     device : str or torch.device
         Device on which to perform sampling.
 
-    Returns
-    -------
+    Return:
     hist : torch.Tensor
         Shape [n_samples + 1], counts of ranks 0..n_samples.
     """
@@ -103,10 +103,10 @@ def rank_histogram_for_lead(mu_all,
     dist = torch.distributions.LogNormal(mu_t, sigma_t)
 
     # Sample shape: [n_samples, N, S]
-    samples = dist.rsample((n_samples,))  # rsample if you want gradients, sample otherwise
+    samples = dist.rsample((n_samples,))
 
     # Flatten across (N, S): treat each (forecast_time, station) as an independent case
-    y_flat = y_t.reshape(-1)                    # [M]
+    y_flat = y_t.reshape(-1)                       # [M]
     samples_flat = samples.reshape(n_samples, -1)  # [n_samples, M]
 
     # Keep only finite targets
@@ -579,16 +579,14 @@ def train_with_config(cfg: DictConfig, trial=None):
     """
     Core training function that can be used by both standalone training and Optuna tuning.
     
-    Parameters
-    ----------
+    Parameters:
     cfg : DictConfig
         Hydra configuration object
     trial : optuna.Trial, optional
         Optuna trial object for hyperparameter tuning. If provided, will report
         validation metrics and check for pruning.
     
-    Returns
-    -------
+    Returns:
     best_val_loss : float
         Best validation loss (original range) achieved during training.
         Returns float('inf') if training fails.
@@ -655,7 +653,7 @@ def train_with_config(cfg: DictConfig, trial=None):
         epochs = cfg.training.epochs
         criterion = get_loss(cfg.training.loss)
         
-        # Filter optimizer kwargs to only include valid parameters for the selected optimizer
+        # Filter optimizer kwargs (especially for adam vs RMSprop)
         import inspect
         optimizer_class = getattr(torch.optim, cfg.training.optim.algo)
         valid_params = inspect.signature(optimizer_class.__init__).parameters.keys()
@@ -687,7 +685,7 @@ def train_with_config(cfg: DictConfig, trial=None):
             print("######### WARNING: GPU NOT IN USE ##########")
             torch.set_num_threads(16)
         
-        # Track best validation loss for returning to Optuna
+        # needed to track best validation loss for Optuna return
         best_val_loss = float('inf')
         
         with mlflow.start_run(run_name=run_name):
@@ -699,7 +697,6 @@ def train_with_config(cfg: DictConfig, trial=None):
             mlflow.log_dict(cfg_dict, 'training_config.json')
             mlflow.log_params(cfg_dict)
             
-            # Log trial information if using Optuna
             if trial is not None:
                 mlflow.log_param("optuna_trial_number", trial.number)
             
@@ -715,16 +712,14 @@ def train_with_config(cfg: DictConfig, trial=None):
                     y_batch = y_batch.to(device)
 
                     if CUDA_MEM and batch_idx == 1:
-                        torch.cuda.reset_peak_memory_stats()  # Reset BEFORE processing this batch
+                        torch.cuda.reset_peak_memory_stats()
                     
                     predictions = model(x_batch, edge_index=edge_index)  
 
                     loss = criterion(predictions, y_batch)
-                    # Scale loss by accumulation steps to maintain consistent gradient magnitude
                     loss = loss / gradient_accumulation_steps
                     loss.backward()  
                     
-                    # Only update weights every gradient_accumulation_steps
                     if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_dataloader):
                         torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_value)
                         optimizer.step()
@@ -773,7 +768,6 @@ def train_with_config(cfg: DictConfig, trial=None):
                 if avg_val_loss_or < best_val_loss:
                     best_val_loss = avg_val_loss_or
 
-                # Update progress bar with metrics
                 epoch_pbar.set_postfix({
                     'train_loss': f'{avg_loss:.4f}',
                     'val_loss': f'{avg_val_loss:.4f}'
@@ -785,7 +779,6 @@ def train_with_config(cfg: DictConfig, trial=None):
                 
                 # Report to Optuna and check for pruning
                 if trial is not None:
-                    import optuna
                     trial.report(avg_val_loss_or, epoch)
                     if trial.should_prune():
                         raise optuna.TrialPruned()
@@ -892,7 +885,6 @@ def train_with_config(cfg: DictConfig, trial=None):
     
     except Exception as e:
         # Re-raise Optuna pruning exceptions and OOM errors
-        import optuna
         if isinstance(e, optuna.TrialPruned) or "out of memory" in str(e).lower():
             raise
         print(f"Training failed with error: {e}")

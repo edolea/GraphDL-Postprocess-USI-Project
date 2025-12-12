@@ -5,7 +5,7 @@ This script runs multiple training trials with different hyperparameters
 and outputs a config file with the best parameters.
 
 Usage:
-    python tune_simple.py --n-trials 20 --base-config configs/default_training_conf.yaml
+    python tune_simple.py --base-config configs/<your_config>.yaml
 """
 
 import argparse
@@ -14,23 +14,22 @@ from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
 from omegaconf import OmegaConf
 from pathlib import Path
+import torch
 
-# Import the training function
+# training function
 from spatiotemporal_postprocessing.train_tune import train_with_config, set_seed
 
 
 def objective(trial, base_config_path, model_name=None):
     """Run one training trial with suggested hyperparameters."""
     
-    # Load base config - handle Hydra composition if defaults are specified
     cfg = OmegaConf.load(base_config_path)
     
-    # If config has defaults (Hydra composition), load and merge them
+
     if "defaults" in cfg:
         from pathlib import Path
         config_dir = Path(base_config_path).parent
         
-        # Load default config first
         defaults = cfg.get("defaults", [])
         for default in defaults:
             if isinstance(default, str) and default.endswith(".yaml"):
@@ -42,49 +41,40 @@ def objective(trial, base_config_path, model_name=None):
                 
             if default_path.exists():
                 default_cfg = OmegaConf.load(default_path)
-                # Merge: default first, then override with specific config
+                # !! Merge: default first, then override with specific config
                 cfg = OmegaConf.merge(default_cfg, cfg)
         
-        # Remove defaults key from final config
+        # and remove defaults key from final config
         if "defaults" in cfg:
             del cfg["defaults"]
     
-    # Suggest hyperparameters (modify these ranges as needed)
+    # hyperparameters to tune
     cfg.training.optim.kwargs.lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
-    cfg.model.kwargs.hidden_channels = trial.suggest_categorical("hidden_channels", [32, 64, 128])  # Removed 256 to avoid OOM
-    cfg.model.kwargs.num_layers = trial.suggest_categorical("num_layers", [1, 2, 3, 4])  # Removed 6 to avoid OOM
+    cfg.model.kwargs.hidden_channels = trial.suggest_categorical("hidden_channels", [32, 64, 128])
+    cfg.model.kwargs.num_layers = trial.suggest_categorical("num_layers", [1, 2, 3, 4])
     cfg.model.kwargs.dropout_p = trial.suggest_float("dropout_p", 0.1, 0.5)
     
-    # Try batch sizes from largest to smallest, only reducing on OOM
-    batch_sizes = [32, 16]  # Largest to smallest
+    # try batch sizes from largest to smallest, only reducing on OOM
+    batch_sizes = [32, 16]
     
-    # Reduce epochs for faster tuning
-    cfg.training.epochs = 8  # Adjust this
+    cfg.training.epochs = 8
     
-    # Set run name if logging config exists
     run_name_base = f"{model_name}_tune_trial_{trial.number}" if model_name else f"tune_trial_{trial.number}"
     if OmegaConf.select(cfg, "logging.run_name") is not None:
         cfg.logging.run_name = run_name_base
     elif "logging" in cfg:
         cfg.logging.run_name = run_name_base
-    else:
-        # Create logging section if it doesn't exist
-        cfg.logging = {"run_name": run_name_base, "mlflow_tracking_uri": "mlruns", "experiment_id": "tuning"}
     
-    # Try each batch size until one works
-    import torch
     for batch_size in batch_sizes:
         cfg.training.batch_size = batch_size
         
         try:
             val_loss = train_with_config(cfg, trial=trial)
-            # If successful, log which batch size worked
-            print(f"  → Trial {trial.number} succeeded with batch_size={batch_size}")
+            print(f" --> Trial {trial.number} succeeded with batch_size={batch_size}")
             trial.set_user_attr("batch_size", batch_size)
             return val_loss
         except optuna.TrialPruned:
-            # Let Optuna handle pruned trials
-            raise
+            raise # optuna handles pruned trials
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 if torch.cuda.is_available():
@@ -92,15 +82,14 @@ def objective(trial, base_config_path, model_name=None):
                 
                 # If not the last batch size, try smaller
                 if batch_size != batch_sizes[-1]:
-                    print(f"  ⚠ Trial {trial.number} OOM with batch_size={batch_size}, trying smaller...")
+                    print(f" --> Trial {trial.number} OOM with batch_size={batch_size}, trying smaller...")
                     continue
                 else:
-                    print(f"\n⚠ Trial {trial.number} failed with OOM even at smallest batch_size={batch_size}")
+                    print(f"\n!!! Trial {trial.number} failed with OOM even at smallest batch_size={batch_size} !!!")
                     return float('inf')
             else:
                 raise
     
-    # Should not reach here
     return float('inf')
 
 
@@ -114,17 +103,14 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     
-    # Auto-generate output name if not provided
+    # output name
     if args.output_name is None:
-        base_name = Path(args.base_config).stem  # Gets filename without extension
+        base_name = Path(args.base_config).stem  # filename without extension
         args.output_name = f"{base_name}_best"
-    
-    # Extract model name for logging
-    model_name = Path(args.base_config).stem
-    
+    model_name = Path(args.base_config).stem    
     set_seed(args.seed)
     
-    # Create study
+    # create study
     study = optuna.create_study(
         direction="minimize",
         pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=5),
@@ -134,11 +120,11 @@ def main():
     print(f"Starting tuning with {args.n_trials} trials...")
     print(f"Base config: {args.base_config}\n")
     
-    # Create tuning directory if it doesn't exist
+    # create tuning directory
     tuning_dir = Path("tuning")
     tuning_dir.mkdir(exist_ok=True)
     
-    # Track all trials for report
+    # tracking
     trial_report = []
     trial_report.append("="*80)
     trial_report.append(f"HYPERPARAMETER TUNING REPORT - {args.output_name}")
@@ -149,10 +135,9 @@ def main():
     trial_report.append("="*80)
     trial_report.append("")
     
-    # Run optimization - continue until we get n_trials valid runs (completed or pruned)
-    # Only OOM failures (value=inf) don't count toward the target
-    valid_trials = 0  # Successful completions + pruned trials
-    max_attempts = args.n_trials * 5  # Allow more attempts for OOM cases
+    # optimization - continue until we get n_trials valid runs (completed or pruned)
+    valid_trials = 0
+    max_attempts = args.n_trials * 5  # more attempts for OOM cases
     
     for attempt in range(max_attempts):
         if valid_trials >= args.n_trials:
@@ -164,71 +149,63 @@ def main():
                 n_trials=1,
                 show_progress_bar=False
             )
-            # Check trial state
+
             last_trial = study.trials[-1]
             if last_trial.state == optuna.trial.TrialState.COMPLETE:
                 if last_trial.value != float('inf'):
                     valid_trials += 1
-                    msg = f"✓ Trial {valid_trials}/{args.n_trials} complete | val_loss: {last_trial.value:.6f}"
+                    msg = f" ==> Trial {valid_trials}/{args.n_trials} complete | val_loss: {last_trial.value:.6f}"
                     print(msg)
                     trial_report.append(f"Trial {last_trial.number}: SUCCESS")
-                    trial_report.append(f"  Status: Complete")
-                    trial_report.append(f"  Val Loss: {last_trial.value:.6f}")
-                    trial_report.append(f"  Params: {last_trial.params}")
-                    # Log actual batch size used (might be smaller due to OOM)
+                    trial_report.append(f"\tStatus: Complete")
+                    trial_report.append(f"\tVal Loss: {last_trial.value:.6f}")
+                    trial_report.append(f"\tParams: {last_trial.params}")
+
                     if "batch_size" in last_trial.user_attrs:
-                        trial_report.append(f"  Actual Batch Size: {last_trial.user_attrs['batch_size']}")
+                        trial_report.append(f"\tActual Batch Size: {last_trial.user_attrs['batch_size']}")
                     trial_report.append("")
                 else:
-                    msg = f"⚠ Trial {last_trial.number} failed (OOM)"
+                    msg = f" !! Trial {last_trial.number} failed (OOM) !!"
                     print(msg)
                     trial_report.append(f"Trial {last_trial.number}: FAILED (OOM)")
-                    trial_report.append(f"  Status: Complete but returned inf")
-                    trial_report.append(f"  Params: {last_trial.params}")
+                    trial_report.append(f"\tStatus: Complete but returned inf")
+                    trial_report.append(f"\tParams: {last_trial.params}")
                     trial_report.append("")
             elif last_trial.state == optuna.trial.TrialState.PRUNED:
-                valid_trials += 1  # Pruned trials count as valid
-                msg = f"✂ Trial {valid_trials}/{args.n_trials} pruned (underperforming)"
+                valid_trials += 1
+                msg = f" ==> Trial {valid_trials}/{args.n_trials} pruned (underperforming)"
                 print(msg)
                 trial_report.append(f"Trial {last_trial.number}: PRUNED (counts as valid)")
-                trial_report.append(f"  Status: Pruned by MedianPruner")
-                trial_report.append(f"  Params: {last_trial.params}")
+                trial_report.append(f"\tStatus: Pruned by MedianPruner")
+                trial_report.append(f"\tParams: {last_trial.params}")
                 trial_report.append("")
         except Exception as e:
-            msg = f"⚠ Trial failed with exception: {e}"
+            msg = f"!!!! Trial failed with exception: {e} !!!!!"
             print(msg)
             trial_report.append(f"Trial {attempt}: EXCEPTION")
-            trial_report.append(f"  Error: {str(e)}")
+            trial_report.append(f"\tError: {str(e)}")
             trial_report.append("")
             continue
     
-    # Check if we hit max attempts without reaching target
     if valid_trials < args.n_trials:
-        print(f"\n⚠ WARNING: Only completed {valid_trials}/{args.n_trials} valid trials after {max_attempts} attempts")
-        print(f"   (Too many OOM failures - consider reducing search space)")
+        print(f"\n**** WARNING ****: Only completed {valid_trials}/{args.n_trials} valid trials after {max_attempts} attempts")
+        print(f"\t(Too many OOM failures")
     
-    # Print results
     print("\n" + "="*60)
     print("TUNING COMPLETE!")
     print("="*60)
     
-    # Check if we have any successful (non-inf) trials to use for best config
+    # check any successful (non-inf) trials to use for best config
     successful_completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value != float('inf')]
     if len(successful_completed_trials) == 0:
-        print("\n❌ ERROR: No successful trials completed!")
-        print("All trials either failed with OOM or were pruned.")
-        print("\nPlease check:")
-        print("  - Reduce search space (smaller hidden_channels, fewer num_layers)")
-        print("  - Use smaller batch sizes in tune_simple.py")
-        print("  - Check if model architecture fits in memory")
+        print("\n**** ERROR ***: No successful trials completed!")
+        print("All trials failed with OOM or pruned!!!!")
         
-        # Save error report
         trial_report.append("="*80)
         trial_report.append("TUNING FAILED")
         trial_report.append("="*80)
         trial_report.append(f"Total trials attempted: {len(study.trials)}")
         trial_report.append(f"Valid trials (completed or pruned): {valid_trials}")
-        trial_report.append(f"All completed trials had OOM errors")
         trial_report.append("")
         
         report_path = tuning_dir / f"{args.output_name}_report.txt"
@@ -243,7 +220,7 @@ def main():
     for key, value in study.best_params.items():
         print(f"  {key}: {value}")
     
-    # Add summary to report
+    # summary
     trial_report.append("="*80)
     trial_report.append("FINAL RESULTS")
     trial_report.append("="*80)
@@ -260,19 +237,16 @@ def main():
     trial_report.append("")
     trial_report.append("="*80)
     
-    # Save report to file
     report_path = tuning_dir / f"{args.output_name}_report.txt"
     with open(report_path, 'w') as f:
         f.write('\n'.join(trial_report))
     
     print(f"\n✓ Tuning report saved to: {report_path}")
     
-    # Create config with best parameters
+    # new config with best parameters
     best_cfg = OmegaConf.load(args.base_config)
     
-    # Handle Hydra defaults composition
     if "defaults" in best_cfg:
-        # Add _self_ to defaults list for Hydra 1.1+
         defaults = best_cfg.get("defaults", [])
         if "_self_" not in defaults:
             defaults.append("_self_")
@@ -283,26 +257,18 @@ def main():
     best_cfg.model.kwargs.num_layers = study.best_params["num_layers"]
     best_cfg.model.kwargs.dropout_p = study.best_params["dropout_p"]
     
-    # Use the actual batch size that worked (stored in user_attrs)
     best_trial = study.best_trial
     if "batch_size" in best_trial.user_attrs:
         best_cfg.training.batch_size = best_trial.user_attrs["batch_size"]
         print(f"  (using batch_size={best_trial.user_attrs['batch_size']} - largest that fit in memory)")
     else:
-        best_cfg.training.batch_size = 32  # fallback
-    
-    # Ensure seed field exists (required for Hydra overrides)
-    if "seed" not in best_cfg:
-        best_cfg.seed = 42
+        best_cfg.training.batch_size = 32
     
     # Save to configs directory
     output_path = Path("configs") / f"{args.output_name}.yaml"
     OmegaConf.save(best_cfg, output_path)
     
-    print(f"✓ Best config saved to: {output_path}")
-    print(f"\nTo use it, run:")
-    print(f"  python -m spatiotemporal_postprocessing.train --config-name {args.output_name}")
-
+    print(f" ==> Best config saved to: {output_path}")
 
 if __name__ == "__main__":
     main()

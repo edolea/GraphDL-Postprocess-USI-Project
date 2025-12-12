@@ -23,8 +23,6 @@ import optuna
 
 CUDA_MEM = False
 
-#TODO: improve talagrand by keeping all in gpu, not moving to cpu and then gpu
-
 @torch.no_grad()
 def collect_model_outputs(model, 
                           data_loader, 
